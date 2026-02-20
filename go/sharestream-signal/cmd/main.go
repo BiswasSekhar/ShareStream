@@ -333,7 +333,7 @@ func handleCreateRoom(s *socket.Socket, data map[string]interface{}) {
 }
 
 func handleJoinRoom(s *socket.Socket, data map[string]interface{}) {
-	log.Printf("Join room: %+v", data)
+	log.Printf("[JOIN] Join room from %s: %+v", s.Id(), data)
 	code, ok := data["code"].(string)
 	if !ok {
 		s.Emit("room-joined", map[string]interface{}{
@@ -391,7 +391,7 @@ func handleLeaveRoom(s *socket.Socket, data map[string]interface{}) {
 }
 
 func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
-	log.Printf("Join request: %+v", data)
+	log.Printf("[JOIN] Join request from %s: %+v", s.Id(), data)
 	code, ok := data["code"].(string)
 	name, nameOk := data["name"].(string)
 	if !ok || !nameOk {
@@ -430,7 +430,7 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 }
 
 func handleJoinApprove(s *socket.Socket, data map[string]interface{}) {
-	log.Printf("Join approve: %+v", data)
+	log.Printf("[JOIN] Join approve from %s: %+v", s.Id(), data)
 	code, ok := data["code"].(string)
 	participantID, pOk := data["participantId"].(string)
 	if !ok || !pOk {

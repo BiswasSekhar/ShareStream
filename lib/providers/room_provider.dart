@@ -222,7 +222,11 @@ class RoomProvider extends ChangeNotifier {
     _joinPending = false;
     _joinApproved = true;
     _joinRejected = false;
-    debugPrint('[room] Join approved');
+    debugPrint('[room] Join approved - now joining room');
+    // Actually join the room after approval
+    if (_roomCode != null) {
+      _socket.joinRoom(_roomCode!, name: _userName);
+    }
     notifyListeners();
   }
 

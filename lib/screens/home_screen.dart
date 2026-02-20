@@ -184,14 +184,16 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       final parts = rawInput.split('#');
       if (parts.length >= 2) {
         explicitServerUrl = parts[0].trim();
-        codeToUse = parts[1].trim().toUpperCase();
+        // Extract only the room code (first 6 alphanumeric chars)
+        final extractedCode = parts[1].trim().toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+        codeToUse = extractedCode.length >= 6 ? extractedCode.substring(0, 6) : extractedCode;
         _hasExplicitServerUrl = true;
         // Update UI to reflect the parsed values
         setState(() {
           _serverController.text = explicitServerUrl!;
           _roomCodeController.text = codeToUse;
         });
-        debugPrint('[home] Parsed explicit server URL from link: $explicitServerUrl');
+        debugPrint('[home] Parsed from link - server: $explicitServerUrl, room: $codeToUse');
       }
     } else if (rawInput.toLowerCase().startsWith('http')) {
       // Handle URL without # - try to extract room code from query params or path

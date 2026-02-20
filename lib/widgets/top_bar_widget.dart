@@ -15,6 +15,7 @@ class TopBarWidget extends StatelessWidget {
   final VoidCallback onToggleVideoCall;
   final VoidCallback onToggleParticipants;
   final VoidCallback onToggleChat;
+  final int pendingJoinRequests;
 
   const TopBarWidget({
     super.key,
@@ -25,6 +26,7 @@ class TopBarWidget extends StatelessWidget {
     required this.onToggleVideoCall,
     required this.onToggleParticipants,
     required this.onToggleChat,
+    this.pendingJoinRequests = 0,
   });
 
   void _copyRoomCode(BuildContext context) {
@@ -162,15 +164,39 @@ class TopBarWidget extends StatelessWidget {
               );
             },
           ),
-          // Toggle participants
-          IconButton(
-            onPressed: onToggleParticipants,
-            icon: Icon(
-              Icons.people_alt_rounded,
-              size: 20,
-              color: showParticipants ? AppTheme.primary : AppTheme.textMuted,
-            ),
-            tooltip: 'Participants',
+          // Toggle participants with pending badge
+          Stack(
+            children: [
+              IconButton(
+                onPressed: onToggleParticipants,
+                icon: Icon(
+                  Icons.people_alt_rounded,
+                  size: 20,
+                  color: showParticipants ? AppTheme.primary : AppTheme.textMuted,
+                ),
+                tooltip: 'Participants',
+              ),
+              if (pendingJoinRequests > 0)
+                Positioned(
+                  right: 4,
+                  top: 4,
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: const BoxDecoration(
+                      color: AppTheme.error,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Text(
+                      '$pendingJoinRequests',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
           ),
           // Toggle chat
           IconButton(

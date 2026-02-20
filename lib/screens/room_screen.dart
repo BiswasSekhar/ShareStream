@@ -35,6 +35,9 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
   Duration _duration = Duration.zero;
   bool _controlsVisible = true;
   bool _videoLoaded = false;
+  
+  // ─── Join Requests ───
+  final List<Map<String, String>> _pendingJoinRequests = [];
 
   @override
   void initState() {
@@ -72,6 +75,16 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
     };
     provider.socket.onSeekRequested = (pos) {
       _player.seek(Duration(seconds: pos.toInt()));
+    };
+    
+    // Handle join requests (for host)
+    provider.socket.onJoinRequest = (participantId, name) {
+      if (mounted) {
+        setState(() {
+          _pendingJoinRequests.add({'id': participantId, 'name': name});
+        });
+        _showJoinRequestDialog(participantId, name);
+      }
     };
 
     // Torrent auto-play: when viewer's torrent service gets a server URL
@@ -161,6 +174,43 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
     }
     if (mounted) setState(() {});
   }
+  
+  void _showJoinRequestDialog(String participantId, String name) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppTheme.bgCard,
+        title: const Text('Join Request', style: TextStyle(color: AppTheme.textPrimary)),
+        content: Text('$name wants to join the room.', style: const TextStyle(color: AppTheme.textSecondary)),
+        actions: [
+          TextButton(
+            onPressed: () {
+              final provider = context.read<RoomProvider>();
+              provider.rejectJoin(participantId);
+              setState(() {
+                _pendingJoinRequests.removeWhere((r) => r['id'] == participantId);
+              });
+              Navigator.pop(context);
+            },
+            child: const Text('Reject', style: TextStyle(color: AppTheme.error)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.success),
+            onPressed: () {
+              final provider = context.read<RoomProvider>();
+              provider.approveJoin(participantId);
+              setState(() {
+                _pendingJoinRequests.removeWhere((r) => r['id'] == participantId);
+              });
+              Navigator.pop(context);
+            },
+            child: const Text('Approve'),
+          ),
+        ],
+      ),
+    );
+  }
 
   void _sendMessage() {
     final text = _chatController.text.trim();
@@ -212,6 +262,7 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                     onToggleVideoCall: _toggleVideoCall,
                     onToggleParticipants: () => setState(() => _showParticipants = !_showParticipants),
                     onToggleChat: () => setState(() => _showChat = !_showChat),
+                    pendingJoinRequests: _pendingJoinRequests.length,
                   ),
                   Expanded(
                     child: LayoutBuilder(
