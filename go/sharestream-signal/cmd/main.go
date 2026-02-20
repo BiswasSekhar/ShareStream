@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -862,27 +863,50 @@ func findOrDownloadCloudflared() (string, error) {
 		return path, nil
 	}
 
-	// Use %APPDATA%\sharestream\ — always writable and executable
-	appData := os.Getenv("APPDATA")
-	var downloadDir string
-	if appData != "" {
-		downloadDir = filepath.Join(appData, "sharestream")
-	} else {
-		downloadDir = "."
+	// Determine OS-specific paths and download URL
+	var binaryName, downloadURL, downloadDir string
+	
+	switch runtime.GOOS {
+	case "darwin":
+		binaryName = "cloudflared"
+		homeDir := os.Getenv("HOME")
+		downloadDir = filepath.Join(homeDir, ".sharestream")
+		if runtime.GOARCH == "arm64" {
+			downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-darwin-arm64"
+		} else {
+			downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-darwin-amd64"
+		}
+	case "linux":
+		binaryName = "cloudflared"
+		homeDir := os.Getenv("HOME")
+		downloadDir = filepath.Join(homeDir, ".sharestream")
+		downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64"
+	case "windows":
+		binaryName = "cloudflared.exe"
+		appData := os.Getenv("APPDATA")
+		if appData != "" {
+			downloadDir = filepath.Join(appData, "sharestream")
+		} else {
+			downloadDir = "."
+		}
+		downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-windows-amd64.exe"
+	default:
+		return "", fmt.Errorf("cloudflared not found in PATH and auto-download not supported for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
+
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create download dir: %v", err)
 	}
 
-	localPath := filepath.Join(downloadDir, "cloudflared.exe")
+	localPath := filepath.Join(downloadDir, binaryName)
 	if _, err := os.Stat(localPath); err == nil {
 		log.Printf("Using cached cloudflared at: %s", localPath)
 		return localPath, nil
 	}
 
-	log.Printf("cloudflared not found, downloading to %s...", localPath)
+	log.Printf("cloudflared not found, downloading from %s to %s...", downloadURL, localPath)
 
-	resp, err := http.Get("https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-windows-amd64.exe")
+	resp, err := http.Get(downloadURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to download cloudflared: %v", err)
 	}
@@ -902,6 +926,11 @@ func findOrDownloadCloudflared() (string, error) {
 	if err != nil {
 		os.Remove(localPath)
 		return "", fmt.Errorf("failed to save cloudflared: %v", err)
+	}
+
+	// Make executable on Unix systems
+	if runtime.GOOS != "windows" {
+		os.Chmod(localPath, 0755)
 	}
 
 	log.Printf("cloudflared downloaded to: %s", localPath)

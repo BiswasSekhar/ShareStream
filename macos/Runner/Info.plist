@@ -28,5 +28,9 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSCameraUsageDescription</key>
+	<string>ShareStream needs camera access for video calls with other participants in the room.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ShareStream needs microphone access for voice calls with other participants in the room.</string>
 </dict>
 </plist>
