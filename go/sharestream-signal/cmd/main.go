@@ -430,7 +430,7 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 }
 
 func handleJoinApprove(s *socket.Socket, data map[string]interface{}) {
-	log.Printf("[JOIN] Join approve from %s: %+v", s.Id(), data)
+	log.Printf("[JOIN] Join approve from host %s: %+v", s.Id(), data)
 	code, ok := data["code"].(string)
 	participantID, pOk := data["participantId"].(string)
 	if !ok || !pOk {

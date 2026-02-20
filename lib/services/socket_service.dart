@@ -369,6 +369,7 @@ class SocketService {
     _isHost = false;
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
+    debugPrint('[socket] Emitting join-room for code: $normalizedCode, participant: $_participantId');
     _socket?.emit('join-room', {
       'code': normalizedCode,
       'participantId': _participantId,
@@ -380,6 +381,7 @@ class SocketService {
   void joinRequest(String code, String name) {
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
+    debugPrint('[socket] Sending join-request for code: $normalizedCode, participant: $_participantId');
     _socket?.emit('join-request', {
       'code': normalizedCode,
       'participantId': _participantId,
@@ -388,14 +390,14 @@ class SocketService {
   }
 
   void approveJoin(String participantId) {
-    _socket?.emit('approve-join', {
+    _socket?.emit('join-approve', {
       'participantId': participantId,
     });
     debugPrint('[socket] Approved join for: $participantId');
   }
 
   void rejectJoin(String participantId) {
-    _socket?.emit('reject-join', {
+    _socket?.emit('join-reject', {
       'participantId': participantId,
     });
     debugPrint('[socket] Rejected join for: $participantId');

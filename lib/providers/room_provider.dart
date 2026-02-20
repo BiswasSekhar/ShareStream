@@ -222,10 +222,13 @@ class RoomProvider extends ChangeNotifier {
     _joinPending = false;
     _joinApproved = true;
     _joinRejected = false;
-    debugPrint('[room] Join approved - now joining room');
+    debugPrint('[room] Join approved - now joining room $_roomCode as $_userName');
     // Actually join the room after approval
     if (_roomCode != null) {
       _socket.joinRoom(_roomCode!, name: _userName);
+      debugPrint('[room] Sent join-room request');
+    } else {
+      debugPrint('[room] ERROR: _roomCode is null!');
     }
     notifyListeners();
   }
