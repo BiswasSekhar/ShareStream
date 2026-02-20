@@ -427,6 +427,8 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 		return
 	}
 
+	log.Printf("[JOIN] Storing join request - participantID: %s, name: %s, socket: %s", participantID, name, s.Id())
+
 	room.mu.Lock()
 	room.Pending[participantID] = name
 	room.mu.Unlock()
@@ -438,6 +440,7 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 	})
 
 	// Notify the host
+	log.Printf("[JOIN] Notifying host %s of join request from participant %s (%s)", room.Host, participantID, name)
 	io_.To(socket.Room(room.Host)).Emit("join-request", map[string]interface{}{
 		"participantId": participantID,
 		"name":          name,
