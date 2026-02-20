@@ -190,6 +190,14 @@ func registerEventHandlers(client *socket.Socket) {
 		data := parseData(args)
 		handleJoinApprove(client, data)
 	})
+	client.On("register-participant", func(args ...any) {
+		data := parseData(args)
+		participantID, ok := data["participantId"].(string)
+		if ok && participantID != "" {
+			client.Join(socket.Room(participantID))
+			log.Printf("[JOIN] Client %s registered as participant %s", client.Id(), participantID)
+		}
+	})
 	client.On("join-reject", func(args ...any) {
 		data := parseData(args)
 		handleJoinReject(client, data)
@@ -335,12 +343,16 @@ func handleCreateRoom(s *socket.Socket, data map[string]interface{}) {
 func handleJoinRoom(s *socket.Socket, data map[string]interface{}) {
 	log.Printf("[JOIN] Join room from %s: %+v", s.Id(), data)
 	code, ok := data["code"].(string)
+	participantID, pOk := data["participantId"].(string)
 	if !ok {
 		s.Emit("room-joined", map[string]interface{}{
 			"success": false,
 			"error":   "invalid room code",
 		})
 		return
+	}
+	if !pOk {
+		participantID = string(s.Id())
 	}
 
 	room := roomManager.GetRoom(code)
@@ -353,7 +365,8 @@ func handleJoinRoom(s *socket.Socket, data map[string]interface{}) {
 	}
 
 	room.mu.RLock()
-	approved := room.Approved[string(s.Id())]
+	approved := room.Approved[participantID]
+	name := room.ApprovedNames[participantID]
 	room.mu.RUnlock()
 
 	if !approved {
@@ -366,6 +379,7 @@ func handleJoinRoom(s *socket.Socket, data map[string]interface{}) {
 	}
 
 	s.Join(socket.Room(code))
+	log.Printf("[JOIN] Socket %s joined room %s as participant %s (%s)", s.Id(), code, participantID, name)
 	s.Emit("room-joined", map[string]interface{}{
 		"success": true,
 		"room": map[string]interface{}{
@@ -374,7 +388,8 @@ func handleJoinRoom(s *socket.Socket, data map[string]interface{}) {
 		},
 	})
 	io_.To(socket.Room(code)).Emit("participant-joined", map[string]interface{}{
-		"id": string(s.Id()),
+		"id":   participantID,
+		"name": name,
 	})
 }
 
@@ -394,7 +409,8 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 	log.Printf("[JOIN] Join request from %s: %+v", s.Id(), data)
 	code, ok := data["code"].(string)
 	name, nameOk := data["name"].(string)
-	if !ok || !nameOk {
+	participantID, pOk := data["participantId"].(string)
+	if !ok || !nameOk || !pOk {
 		s.Emit("join-request-result", map[string]interface{}{
 			"success": false,
 			"error":   "invalid request",
@@ -412,18 +428,18 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 	}
 
 	room.mu.Lock()
-	room.Pending[string(s.Id())] = name
+	room.Pending[participantID] = name
 	room.mu.Unlock()
 
 	s.Emit("join-request-result", map[string]interface{}{
 		"success":       true,
 		"status":        "pending",
-		"participantId": string(s.Id()),
+		"participantId": participantID,
 	})
 
 	// Notify the host
 	io_.To(socket.Room(room.Host)).Emit("join-request", map[string]interface{}{
-		"participantId": string(s.Id()),
+		"participantId": participantID,
 		"name":          name,
 		"code":          code,
 	})
@@ -455,6 +471,9 @@ func handleJoinApprove(s *socket.Socket, data map[string]interface{}) {
 		room.Approved[participantID] = true
 		room.ApprovedNames[participantID] = name
 		delete(room.Pending, participantID)
+		log.Printf("[JOIN] Approved participant %s (%s) for room %s", participantID, name, code)
+	} else {
+		log.Printf("[JOIN] Warning: participant %s not in pending list for room %s", participantID, code)
 	}
 	room.mu.Unlock()
 
@@ -463,7 +482,7 @@ func handleJoinApprove(s *socket.Socket, data map[string]interface{}) {
 		"participantId": participantID,
 	})
 
-	// Notify the approved participant
+	// Notify the approved participant using socket room
 	io_.To(socket.Room(participantID)).Emit("join-approved", map[string]interface{}{
 		"code": code,
 	})

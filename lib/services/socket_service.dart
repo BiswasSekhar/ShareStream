@@ -370,6 +370,8 @@ class SocketService {
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
     debugPrint('[socket] Emitting join-room for code: $normalizedCode, participant: $_participantId');
+    // Register participant ID so server can send targeted messages
+    _socket?.emit('register-participant', {'participantId': _participantId});
     _socket?.emit('join-room', {
       'code': normalizedCode,
       'participantId': _participantId,
@@ -382,6 +384,8 @@ class SocketService {
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
     debugPrint('[socket] Sending join-request for code: $normalizedCode, participant: $_participantId');
+    // Register participant ID so server can send targeted messages
+    _socket?.emit('register-participant', {'participantId': _participantId});
     _socket?.emit('join-request', {
       'code': normalizedCode,
       'participantId': _participantId,
