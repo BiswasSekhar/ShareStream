@@ -3,7 +3,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../services/webrtc_service.dart';
 import '../theme/app_theme.dart';
 
-/// Floating video call overlay with PIP self-view and remote participant grid.
+/// Draggable PIP video call cube with controls inside.
 class VideoCallOverlay extends StatefulWidget {
   final WebRTCService webrtcService;
   final VoidCallback onEndCall;
@@ -18,34 +18,26 @@ class VideoCallOverlay extends StatefulWidget {
   State<VideoCallOverlay> createState() => _VideoCallOverlayState();
 }
 
-class _VideoCallOverlayState extends State<VideoCallOverlay>
-    with TickerProviderStateMixin {
+class _VideoCallOverlayState extends State<VideoCallOverlay> {
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final Map<String, RTCVideoRenderer> _remoteRenderers = {};
-  late AnimationController _fadeController;
 
-  // PIP drag position
-  Offset _pipOffset = const Offset(16, 16);
+  // Drag position (bottom-right corner by default)
+  Offset _position = const Offset(16, 80);
+  bool _expanded = false; // toggle between small PIP and expanded view
 
   @override
   void initState() {
     super.initState();
-    _fadeController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 300),
-    );
     _initializeRenderers();
-    _fadeController.forward();
   }
 
   Future<void> _initializeRenderers() async {
     await _localRenderer.initialize();
 
-    // Listen for local stream changes
     widget.webrtcService.localStream.addListener(_onLocalStreamChanged);
     widget.webrtcService.remoteStreams.addListener(_onRemoteStreamsChanged);
 
-    // Set initial local stream
     _onLocalStreamChanged();
     _onRemoteStreamsChanged();
   }
@@ -61,7 +53,6 @@ class _VideoCallOverlayState extends State<VideoCallOverlay>
   void _onRemoteStreamsChanged() async {
     final streams = widget.webrtcService.remoteStreams.value;
 
-    // Remove renderers for peers no longer present
     final toRemove = _remoteRenderers.keys
         .where((id) => !streams.containsKey(id))
         .toList();
@@ -70,7 +61,6 @@ class _VideoCallOverlayState extends State<VideoCallOverlay>
       _remoteRenderers.remove(id);
     }
 
-    // Add renderers for new peers
     for (final entry in streams.entries) {
       if (!_remoteRenderers.containsKey(entry.key)) {
         final renderer = RTCVideoRenderer();
@@ -89,7 +79,6 @@ class _VideoCallOverlayState extends State<VideoCallOverlay>
   void dispose() {
     widget.webrtcService.localStream.removeListener(_onLocalStreamChanged);
     widget.webrtcService.remoteStreams.removeListener(_onRemoteStreamsChanged);
-    _fadeController.dispose();
     _localRenderer.dispose();
     for (final r in _remoteRenderers.values) {
       r.dispose();
@@ -99,256 +88,194 @@ class _VideoCallOverlayState extends State<VideoCallOverlay>
 
   @override
   Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: _fadeController,
-      child: Stack(
-        children: [
-          // Remote video grid
-          _buildRemoteGrid(),
+    final width = _expanded ? 320.0 : 180.0;
+    final height = _expanded ? 280.0 : 140.0;
 
-          // PIP self-view (draggable)
-          Positioned(
-            right: _pipOffset.dx,
-            bottom: _pipOffset.dy + 80, // above controls
-            child: GestureDetector(
-              onPanUpdate: (details) {
-                setState(() {
-                  _pipOffset = Offset(
-                    (_pipOffset.dx - details.delta.dx).clamp(0, MediaQuery.of(context).size.width - 140),
-                    (_pipOffset.dy - details.delta.dy).clamp(0, MediaQuery.of(context).size.height - 200),
-                  );
-                });
-              },
-              child: _buildPipView(),
-            ),
-          ),
-
-          // Controls bar at bottom
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: _buildControlsBar(),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRemoteGrid() {
-    if (_remoteRenderers.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.people_outline, size: 64, color: Colors.white.withValues(alpha: 0.3)),
-            const SizedBox(height: 16),
-            Text(
-              'Waiting for others to join the call...',
-              style: TextStyle(
-                color: Colors.white.withValues(alpha: 0.5),
-                fontSize: 16,
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    final count = _remoteRenderers.length;
-    final cols = count <= 1 ? 1 : (count <= 4 ? 2 : 3);
-
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 80),
-      child: GridView.builder(
-        physics: const NeverScrollableScrollPhysics(),
-        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: cols,
-          childAspectRatio: 4 / 3,
-          mainAxisSpacing: 4,
-          crossAxisSpacing: 4,
-        ),
-        itemCount: count,
-        itemBuilder: (context, index) {
-          final entry = _remoteRenderers.entries.elementAt(index);
-          return _buildRemoteVideoTile(entry.key, entry.value);
+    return Positioned(
+      right: _position.dx,
+      bottom: _position.dy,
+      child: GestureDetector(
+        onPanUpdate: (details) {
+          setState(() {
+            _position = Offset(
+              (_position.dx - details.delta.dx).clamp(0, MediaQuery.of(context).size.width - width),
+              (_position.dy - details.delta.dy).clamp(0, MediaQuery.of(context).size.height - height - 100),
+            );
+          });
         },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          width: width,
+          height: height,
+          decoration: BoxDecoration(
+            color: Colors.black,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: AppTheme.accent.withValues(alpha: 0.5),
+              width: 2,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.6),
+                blurRadius: 16,
+                spreadRadius: 2,
+              ),
+            ],
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Stack(
+            children: [
+              // Video content
+              _buildVideoContent(),
+
+              // Controls overlay at bottom
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: _buildControls(),
+              ),
+
+              // Expand/collapse button
+              Positioned(
+                top: 4,
+                right: 4,
+                child: _buildSmallButton(
+                  icon: _expanded ? Icons.close_fullscreen : Icons.open_in_full,
+                  onTap: () => setState(() => _expanded = !_expanded),
+                  size: 20,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
 
-  Widget _buildRemoteVideoTile(String peerId, RTCVideoRenderer renderer) {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.black87,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: AppTheme.accent.withValues(alpha: 0.3),
-          width: 1,
-        ),
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Stack(
+  Widget _buildVideoContent() {
+    // Show remote video if available, otherwise show local
+    if (_remoteRenderers.isNotEmpty) {
+      final firstRemote = _remoteRenderers.values.first;
+      return Stack(
+        fit: StackFit.expand,
         children: [
           RTCVideoView(
-            renderer,
+            firstRemote,
             objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
           ),
-          // Peer ID label
-          Positioned(
-            left: 8,
-            bottom: 8,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                peerId.length > 8 ? peerId.substring(0, 8) : peerId,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w500,
+          // Small local PIP in corner
+          if (widget.webrtcService.localStream.value != null)
+            Positioned(
+              top: 4,
+              left: 4,
+              child: Container(
+                width: 48,
+                height: 36,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: AppTheme.primaryLight, width: 1),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: RTCVideoView(
+                  _localRenderer,
+                  mirror: true,
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
                 ),
               ),
             ),
+        ],
+      );
+    }
+
+    // Only local video
+    if (widget.webrtcService.localStream.value != null) {
+      return RTCVideoView(
+        _localRenderer,
+        mirror: true,
+        objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+      );
+    }
+
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.videocam_off, size: 24, color: Colors.white.withValues(alpha: 0.3)),
+          const SizedBox(height: 4),
+          Text(
+            'Waiting...',
+            style: TextStyle(color: Colors.white.withValues(alpha: 0.4), fontSize: 10),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildPipView() {
+  Widget _buildControls() {
     return Container(
-      width: 130,
-      height: 100,
-      decoration: BoxDecoration(
-        color: Colors.black,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: AppTheme.accentAlt.withValues(alpha: 0.6),
-          width: 2,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: AppTheme.accentAlt.withValues(alpha: 0.3),
-            blurRadius: 12,
-            spreadRadius: 2,
-          ),
-        ],
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: widget.webrtcService.localStream.value != null
-          ? RTCVideoView(
-              _localRenderer,
-              mirror: true,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-            )
-          : const Center(
-              child: Icon(Icons.person, color: Colors.white38, size: 32),
-            ),
-    );
-  }
-
-  Widget _buildControlsBar() {
-    return Container(
-      height: 72,
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [
-            Colors.transparent,
-            Colors.black.withValues(alpha: 0.8),
-          ],
+          colors: [Colors.transparent, Colors.black.withValues(alpha: 0.8)],
         ),
       ),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
-          // Mic toggle
+          // Mic
           ValueListenableBuilder<bool>(
             valueListenable: widget.webrtcService.audioEnabled,
             builder: (_, audioOn, _) {
-              return _buildControlButton(
+              return _buildSmallButton(
                 icon: audioOn ? Icons.mic : Icons.mic_off,
-                label: audioOn ? 'Mute' : 'Unmute',
-                color: audioOn ? Colors.white : Colors.redAccent,
-                bgColor: audioOn
-                    ? Colors.white.withValues(alpha: 0.15)
-                    : Colors.redAccent.withValues(alpha: 0.2),
                 onTap: widget.webrtcService.toggleAudio,
+                color: audioOn ? Colors.white : Colors.redAccent,
               );
             },
           ),
-          const SizedBox(width: 16),
-
-          // Camera toggle
+          // Camera
           ValueListenableBuilder<bool>(
             valueListenable: widget.webrtcService.videoEnabled,
             builder: (_, videoOn, _) {
-              return _buildControlButton(
+              return _buildSmallButton(
                 icon: videoOn ? Icons.videocam : Icons.videocam_off,
-                label: videoOn ? 'Cam Off' : 'Cam On',
-                color: videoOn ? Colors.white : Colors.orangeAccent,
-                bgColor: videoOn
-                    ? Colors.white.withValues(alpha: 0.15)
-                    : Colors.orangeAccent.withValues(alpha: 0.2),
                 onTap: widget.webrtcService.toggleVideo,
+                color: videoOn ? Colors.white : Colors.orangeAccent,
               );
             },
           ),
-          const SizedBox(width: 16),
-
           // End call
-          _buildControlButton(
+          _buildSmallButton(
             icon: Icons.call_end,
-            label: 'End',
+            onTap: widget.onEndCall,
             color: Colors.white,
             bgColor: Colors.redAccent,
-            onTap: widget.onEndCall,
           ),
         ],
       ),
     );
   }
 
-  Widget _buildControlButton({
+  Widget _buildSmallButton({
     required IconData icon,
-    required String label,
-    required Color color,
-    required Color bgColor,
     required VoidCallback onTap,
+    Color color = Colors.white,
+    Color? bgColor,
+    double size = 16,
   }) {
     return GestureDetector(
       onTap: onTap,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 52,
-            height: 52,
-            decoration: BoxDecoration(
-              color: bgColor,
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: color.withValues(alpha: 0.3),
-                width: 1,
-              ),
-            ),
-            child: Icon(icon, color: color, size: 24),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            label,
-            style: TextStyle(
-              color: color.withValues(alpha: 0.7),
-              fontSize: 10,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
+      child: Container(
+        width: 28,
+        height: 28,
+        decoration: BoxDecoration(
+          color: bgColor ?? Colors.white.withValues(alpha: 0.15),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(icon, color: color, size: size),
       ),
     );
   }

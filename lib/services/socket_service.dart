@@ -3,7 +3,7 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 import 'package:flutter/foundation.dart';
 
 /// Socket.IO service for room management, playback sync, and WebRTC signaling.
-/// Connects to the Lovestream server (multi-participant rooms).
+/// Connects to the ShareStream signaling server.
 class SocketService {
   io.Socket? _socket;
   String? _currentRoom;
@@ -23,6 +23,22 @@ class SocketService {
   void Function(bool playing)? onPlayPauseRequested;
   void Function(String magnet, String path)? onTorrentMagnet;
 
+  // Sync callbacks
+  void Function(int timestamp)? onSyncCheck;
+  void Function(String participantId, double time, bool playing)? onSyncReport;
+  void Function(double time, bool playing, String actionId)? onSyncCorrect;
+  void Function(double time, bool playing)? onSyncUpdate;
+
+  // Join approval callbacks
+  void Function(String participantId, String name)? onJoinRequest;
+  void Function(String participantId)? onJoinApproved;
+  void Function()? onJoinRejected;
+  void Function()? onJoinPending;
+
+  // Playback readiness callbacks
+  void Function(int count)? onReadyCountUpdate;
+  void Function()? onStartPlayback;
+
   // WebRTC signaling callbacks
   void Function(String peerId, bool initiator)? onStartWebRTC;
   void Function(String fromId, Map<String, dynamic> offer)? onOffer;
@@ -36,34 +52,62 @@ class SocketService {
   bool get isConnected => connected.value;
 
   void connect(String serverUrl) {
+    debugPrint('[socket] Connecting to: $serverUrl');
+    debugPrint('[socket] Transport: websocket');
+    
     _socket = io.io(serverUrl, <String, dynamic>{
       'transports': ['websocket'],
       'autoConnect': true,
       'reconnection': true,
       'reconnectionDelay': 1000,
       'reconnectionAttempts': 10,
+      'timeout': 20000,
     });
 
     _socket!.onConnect((_) {
-      debugPrint('[socket] Connected: ${_socket!.id}');
+      debugPrint('[socket] ✅ Connected! Socket ID: ${_socket!.id}');
       _userId = _socket!.id;
       connected.value = true;
     });
 
-    _socket!.onDisconnect((_) {
-      debugPrint('[socket] Disconnected');
+    _socket!.onDisconnect((reason) {
+      debugPrint('[socket] ❌ Disconnected. Reason: $reason');
+      connected.value = false;
+    });
+
+    _socket!.on('connect_error', (err) {
+      debugPrint('[socket] ❌ Connection error: $err');
+      debugPrint('[socket]    → Make sure signal server is running on $serverUrl');
+      connected.value = false;
+    });
+
+    _socket!.on('connect_timeout', (_) {
+      debugPrint('[socket] ❌ Connection timed out to $serverUrl');
       connected.value = false;
     });
 
     _socket!.onReconnect((_) {
-      debugPrint('[socket] Reconnected');
+      debugPrint('[socket] Reconnected after disconnect');
       connected.value = true;
       if (_currentRoom != null) {
+        debugPrint('[socket] Re-joining room: $_currentRoom');
         joinRoom(_currentRoom!, name: 'Reconnecting');
       }
     });
 
-    // ─── Participant Events (N-participant) ───
+    _socket!.onReconnectAttempt((attempt) {
+      debugPrint('[socket] Reconnect attempt #$attempt to $serverUrl');
+    });
+
+    _socket!.onReconnectFailed((_) {
+      debugPrint('[socket] ❌ Reconnection failed after all attempts to $serverUrl');
+    });
+
+    _socket!.onReconnectError((err) {
+      debugPrint('[socket] Reconnect error: $err');
+    });
+
+    // Participant Events
     _socket!.on('participant-list', (data) {
       if (data['participants'] is List) {
         participants.value = (data['participants'] as List)
@@ -84,7 +128,7 @@ class SocketService {
       }
     });
 
-    // ─── WebRTC Signaling ───
+    // WebRTC Signaling
     _socket!.on('start-webrtc', (data) {
       final peerId = data['peerId'] as String?;
       final initiator = data['initiator'] as bool? ?? false;
@@ -118,7 +162,7 @@ class SocketService {
       }
     });
 
-    // ─── Torrent / Stream Events ───
+    // Torrent / Stream Events
     _socket!.on('torrent-magnet', (data) {
       debugPrint('[socket] Received torrent magnet');
       magnetUri.value = data['magnetURI'];
@@ -130,18 +174,16 @@ class SocketService {
       );
     });
 
-    // ─── Movie metadata ───
     _socket!.on('movie-loaded', (data) {
       debugPrint('[socket] Movie loaded: ${data['name']}');
       movieName.value = data['name'];
     });
 
-    // ─── Room mode ───
     _socket!.on('room-mode', (data) {
       debugPrint('[socket] Room mode: ${data['mode']}');
     });
 
-    // ─── Playback Sync Events ───
+    // Playback Sync Events
     _socket!.on('sync-play', (data) {
       final time = (data['time'] as num?)?.toDouble();
       onPlayPauseRequested?.call(true);
@@ -170,7 +212,41 @@ class SocketService {
       }
     });
 
-    // ─── Chat Events ───
+    // New Sync Events
+    _socket!.on('sync-check', (data) {
+      final timestamp = (data['timestamp'] as num?)?.toInt();
+      if (timestamp != null) {
+        onSyncCheck?.call(timestamp);
+      }
+    });
+
+    _socket!.on('sync-report', (data) {
+      final participantId = data['participantId'] as String?;
+      final playbackTime = (data['playbackTime'] as num?)?.toDouble();
+      final playing = data['playing'] as bool? ?? false;
+      if (participantId != null && playbackTime != null) {
+        onSyncReport?.call(participantId, playbackTime, playing);
+      }
+    });
+
+    _socket!.on('sync-correct', (data) {
+      final playbackTime = (data['playbackTime'] as num?)?.toDouble();
+      final playing = data['playing'] as bool? ?? false;
+      final actionId = data['actionId'] as String?;
+      if (playbackTime != null) {
+        onSyncCorrect?.call(playbackTime, playing, actionId ?? '');
+      }
+    });
+
+    _socket!.on('sync-update', (data) {
+      final time = (data['time'] as num?)?.toDouble();
+      final playing = data['playing'] as bool? ?? false;
+      if (time != null) {
+        onSyncUpdate?.call(time, playing);
+      }
+    });
+
+    // Chat Events
     _socket!.on('chat-message', (data) {
       final msg = ChatMessage(
         id: data['id'] ?? '',
@@ -189,57 +265,129 @@ class SocketService {
     _socket!.on('error', (data) {
       debugPrint('[socket] Error: $data');
     });
+
+    // Join Approval Events
+    _socket!.on('join-request', (data) {
+      final participantId = data['participantId'] as String?;
+      final name = data['name'] as String? ?? 'Unknown';
+      if (participantId != null) {
+        debugPrint('[socket] Join request from: $name ($participantId)');
+        onJoinRequest?.call(participantId, name);
+      }
+    });
+
+    _socket!.on('join-approved', (data) {
+      final participantId = data['participantId'] as String?;
+      debugPrint('[socket] Join approved for: $participantId');
+      onJoinApproved?.call(participantId ?? '');
+    });
+
+    _socket!.on('join-rejected', (data) {
+      debugPrint('[socket] Join rejected');
+      onJoinRejected?.call();
+    });
+
+    _socket!.on('join-pending', (data) {
+      debugPrint('[socket] Join pending - waiting for approval');
+      onJoinPending?.call();
+    });
+
+    // Playback Readiness Events
+    _socket!.on('ready-count-update', (data) {
+      final count = (data['readyCount'] as num?)?.toInt() ?? 0;
+      debugPrint('[socket] Ready count update: $count');
+      onReadyCountUpdate?.call(count);
+    });
+
+    _socket!.on('playback-started', (data) {
+      debugPrint('[socket] Playback started by host');
+      onStartPlayback?.call();
+    });
+
+    // Room creation/join responses (Go server emits these as events, not acks)
+    _socket!.on('room-created', (data) {
+      debugPrint('[socket] room-created event: $data');
+      if (data != null && data['success'] == true) {
+        _currentRoom = data['room']?['code'];
+        _isHost = true;
+        debugPrint('[socket] Created room: $_currentRoom');
+      } else {
+        debugPrint('[socket] Create room failed: $data');
+      }
+    });
+
+    _socket!.on('room-joined', (data) {
+      debugPrint('[socket] room-joined event: $data');
+      if (data != null && data['success'] == true) {
+        _currentRoom = data['room']?['code'];
+        final role = data['room']?['role'] ?? 'viewer';
+        _isHost = role == 'host';
+        debugPrint('[socket] Joined room: $_currentRoom as $role');
+      } else {
+        debugPrint('[socket] Join failed: ${data?['error']}');
+      }
+    });
   }
 
-  // ─── Generic emit (used by WebRTCService) ───
+  // Generic emit
   void emit(String event, Map<String, dynamic> data) {
     _socket?.emit(event, data);
   }
 
-  // ─── Room Actions ───
+  // Room Actions
   void createRoom({String? name, String? requestedCode}) {
     _isHost = true;
     _participantId = _generateParticipantId();
-    _socket?.emit('create-room', [
-      {
-        'participantId': _participantId,
-        'name': name ?? 'Host',
-        'capabilities': {'nativePlayback': true},
-        'requestedCode': requestedCode,
-      },
-      (dynamic response) {
-        if (response != null && response['success'] == true) {
-          _currentRoom = response['room']?['code'];
-          debugPrint('[socket] Created room: $_currentRoom');
-        } else {
-          debugPrint('[socket] Create room failed: $response');
-        }
-      },
-    ]);
+    _socket?.emit('create-room', {
+      'participantId': _participantId,
+      'name': name ?? 'Host',
+      'capabilities': {'nativePlayback': true},
+      'requestedCode': requestedCode,
+    });
   }
 
   void joinRoom(String code, {String? name}) {
     _isHost = false;
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
-    _socket?.emit('join-room', [
-      {
-        'code': normalizedCode,
-        'participantId': _participantId,
-        'name': name ?? 'Guest',
-        'capabilities': {'nativePlayback': true},
-      },
-      (dynamic response) {
-        if (response != null && response['success'] == true) {
-          _currentRoom = response['room']?['code'];
-          final role = response['room']?['role'] ?? 'viewer';
-          _isHost = role == 'host';
-          debugPrint('[socket] Joined room: $_currentRoom as $role');
-        } else {
-          debugPrint('[socket] Join failed: ${response?['error']}');
-        }
-      },
-    ]);
+    _socket?.emit('join-room', {
+      'code': normalizedCode,
+      'participantId': _participantId,
+      'name': name ?? 'Guest',
+      'capabilities': {'nativePlayback': true},
+    });
+  }
+
+  void joinRequest(String code, String name) {
+    _participantId ??= _generateParticipantId();
+    final normalizedCode = code.trim().toUpperCase();
+    _socket?.emit('join-request', {
+      'code': normalizedCode,
+      'participantId': _participantId,
+      'name': name,
+    });
+  }
+
+  void approveJoin(String participantId) {
+    _socket?.emit('approve-join', {
+      'participantId': participantId,
+    });
+    debugPrint('[socket] Approved join for: $participantId');
+  }
+
+  void rejectJoin(String participantId) {
+    _socket?.emit('reject-join', {
+      'participantId': participantId,
+    });
+    debugPrint('[socket] Rejected join for: $participantId');
+  }
+
+  void requestJoinApproval() {
+    if (_currentRoom == null || _participantId == null) return;
+    _socket?.emit('request-join-status', {
+      'roomCode': _currentRoom,
+      'participantId': _participantId,
+    });
   }
 
   void leaveRoom() {
@@ -255,7 +403,7 @@ class SocketService {
     }
   }
 
-  // ─── Stream Actions ───
+  // Stream Actions
   void shareMagnet(String magnet, String path, String name) {
     _socket?.emit('torrent-magnet', {
       'magnetURI': magnet,
@@ -271,7 +419,7 @@ class SocketService {
     });
   }
 
-  // ─── Playback Sync ───
+  // Playback Sync
   void syncPlay(double time) {
     _socket?.emit('sync-play', {
       'time': time,
@@ -293,9 +441,52 @@ class SocketService {
     });
   }
 
-  // ─── Chat ───
+  // Sync Actions (New)
+  void syncCheck(String code) {
+    _socket?.emit('sync-check', {
+      'code': code,
+    });
+  }
+
+  void syncReport(String code, double time, bool playing, double buffered) {
+    _socket?.emit('sync-report', {
+      'code': code,
+      'time': time,
+      'playing': playing,
+      'buffered': buffered,
+    });
+  }
+
+  void syncCorrect(String participantId, double time, bool playing) {
+    _socket?.emit('sync-correct', {
+      'participantId': participantId,
+      'time': time,
+      'playing': playing,
+    });
+  }
+
+  void syncUpdate(String code, double time, bool playing) {
+    _socket?.emit('sync-update', {
+      'code': code,
+      'time': time,
+      'playing': playing,
+    });
+  }
+
+  // Chat
   void sendMessage(String text) {
     _socket?.emit('chat-message', {'text': text});
+  }
+
+  // Playback Readiness
+  void readyToStart(String code) {
+    _socket?.emit('ready-to-start', {'code': code});
+    debugPrint('[socket] Sent ready-to-start for room: $code');
+  }
+
+  void startPlayback(String code) {
+    _socket?.emit('start-playback', {'code': code});
+    debugPrint('[socket] Sent start-playback for room: $code');
   }
 
   void disconnect() {
@@ -320,8 +511,6 @@ class SocketService {
     return 'flutter_${DateTime.now().millisecondsSinceEpoch}';
   }
 }
-
-// ─── Data Models ───
 
 class Participant {
   final String id;

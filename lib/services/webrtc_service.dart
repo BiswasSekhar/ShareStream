@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart' as webrtc;
 import 'package:flutter_webrtc/flutter_webrtc.dart' show RTCVideoRenderer;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'socket_service.dart';
 
 /// Manages WebRTC mesh connections for video calling.
@@ -8,23 +9,18 @@ import 'socket_service.dart';
 class WebRTCService {
   final SocketService _socket;
 
-  // ICE servers
-  final List<Map<String, dynamic>> _iceServers = [
+  List<Map<String, dynamic>> _iceServers = [
     {'urls': 'stun:stun.l.google.com:19302'},
     {'urls': 'stun:stun1.l.google.com:19302'},
   ];
 
-  // Local media
   webrtc.MediaStream? _localStream;
   bool _audioEnabled = true;
   bool _videoEnabled = true;
 
-  // Peer connections: socketId -> RTCPeerConnection
   final Map<String, webrtc.RTCPeerConnection> _peers = {};
-  // Remote streams: socketId -> MediaStream
   final Map<String, webrtc.MediaStream> _remoteStreams = {};
 
-  // Notifiers
   final ValueNotifier<bool> isInCall = ValueNotifier(false);
   final ValueNotifier<bool> audioEnabled = ValueNotifier(true);
   final ValueNotifier<bool> videoEnabled = ValueNotifier(true);
@@ -32,7 +28,26 @@ class WebRTCService {
   final ValueNotifier<Map<String, webrtc.MediaStream>> remoteStreams = ValueNotifier({});
 
   WebRTCService(this._socket) {
-    // Wire up signaling callbacks
+    _loadTURNCredentials();
+    _setupSignaling();
+  }
+
+  void _loadTURNCredentials() async {
+    final turnUrl = dotenv.env['TURN_URL'];
+    final turnUsername = dotenv.env['TURN_USERNAME'];
+    final turnCredential = dotenv.env['TURN_CREDENTIAL'];
+
+    if (turnUrl != null && turnUsername != null && turnCredential != null) {
+      _iceServers.add({
+        'urls': turnUrl,
+        'username': turnUsername,
+        'credential': turnCredential,
+      });
+      debugPrint('[webrtc] Added TURN server: $turnUrl');
+    }
+  }
+
+  void _setupSignaling() {
     _socket.onStartWebRTC = _onStartWebRTC;
     _socket.onOffer = handleOffer;
     _socket.onAnswer = handleAnswer;
@@ -45,7 +60,7 @@ class WebRTCService {
     _createPeerConnection(peerId, initiator: initiator);
   }
 
-  // ─── Start/Stop Call ──────────────────────────────────────
+  // Start/Stop Call
 
   Future<void> startCall() async {
     try {
@@ -70,7 +85,6 @@ class WebRTCService {
       videoEnabled.value = true;
       isInCall.value = true;
 
-      // Signal readiness to server
       _socket.emit('ready-for-connection', {});
 
       debugPrint('[webrtc] call started, local stream ready');
@@ -81,20 +95,17 @@ class WebRTCService {
   }
 
   Future<void> stopCall() async {
-    // Close all peer connections
     for (final entry in _peers.entries) {
       await entry.value.close();
     }
     _peers.clear();
 
-    // Close remote streams
     for (final stream in _remoteStreams.values) {
       await stream.dispose();
     }
     _remoteStreams.clear();
     remoteStreams.value = {};
 
-    // Stop local stream
     if (_localStream != null) {
       for (final track in _localStream!.getTracks()) {
         await track.stop();
@@ -107,7 +118,7 @@ class WebRTCService {
     debugPrint('[webrtc] call stopped');
   }
 
-  // ─── Audio/Video Controls ─────────────────────────────────
+  // Audio/Video Controls
 
   void toggleAudio() {
     if (_localStream == null) return;
@@ -127,7 +138,7 @@ class WebRTCService {
     videoEnabled.value = _videoEnabled;
   }
 
-  // ─── Peer Connection Management ───────────────────────────
+  // Peer Connection Management
 
   Future<void> _createPeerConnection(String remoteId, {bool initiator = false}) async {
     if (_peers.containsKey(remoteId)) {
@@ -144,14 +155,12 @@ class WebRTCService {
 
     final pc = await webrtc.createPeerConnection(config);
 
-    // Add local tracks
     if (_localStream != null) {
       for (final track in _localStream!.getTracks()) {
         await pc.addTrack(track, _localStream!);
       }
     }
 
-    // ICE candidate handling
     pc.onIceCandidate = (webrtc.RTCIceCandidate candidate) {
       _socket.emit('ice-candidate', {
         'candidate': {
@@ -163,7 +172,6 @@ class WebRTCService {
       });
     };
 
-    // Remote stream handling
     pc.onTrack = (webrtc.RTCTrackEvent event) {
       if (event.streams.isNotEmpty) {
         debugPrint('[webrtc] received remote stream from $remoteId');
@@ -182,7 +190,6 @@ class WebRTCService {
 
     _peers[remoteId] = pc;
 
-    // If initiator, create and send offer
     if (initiator) {
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -194,7 +201,6 @@ class WebRTCService {
     }
   }
 
-  /// Handle incoming offer from a remote peer.
   Future<void> handleOffer(String fromId, Map<String, dynamic> offerMap) async {
     if (!isInCall.value) return;
 
@@ -218,7 +224,6 @@ class WebRTCService {
     debugPrint('[webrtc] sent answer to $fromId');
   }
 
-  /// Handle incoming answer from a remote peer.
   Future<void> handleAnswer(String fromId, Map<String, dynamic> answerMap) async {
     final pc = _peers[fromId];
     if (pc == null) return;
@@ -228,7 +233,6 @@ class WebRTCService {
     debugPrint('[webrtc] set remote answer from $fromId');
   }
 
-  /// Handle incoming ICE candidate.
   Future<void> handleIceCandidate(String fromId, Map<String, dynamic> candidateMap) async {
     final pc = _peers[fromId];
     if (pc == null) return;
@@ -241,7 +245,6 @@ class WebRTCService {
     await pc.addCandidate(candidate);
   }
 
-  /// Remove a peer connection (when they leave).
   Future<void> removePeer(String remoteId) async {
     final pc = _peers.remove(remoteId);
     if (pc != null) {
@@ -255,17 +258,21 @@ class WebRTCService {
     debugPrint('[webrtc] removed peer $remoteId');
   }
 
-  // ─── Getters ──────────────────────────────────────────────
+  void addTurnServer(String url, String username, String credential) {
+    _iceServers.add({
+      'urls': url,
+      'username': username,
+      'credential': credential,
+    });
+    debugPrint('[webrtc] Added TURN server: $url');
+  }
 
   RTCVideoRenderer createRenderer() => RTCVideoRenderer();
 
   int get peerCount => _peers.length;
 
-  // ─── Cleanup ──────────────────────────────────────────────
-
   Future<void> dispose() async {
     await stopCall();
-    // Disconnect signaling callbacks
     _socket.onStartWebRTC = null;
     _socket.onOffer = null;
     _socket.onAnswer = null;

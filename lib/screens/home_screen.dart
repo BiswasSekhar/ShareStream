@@ -2,13 +2,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:provider/provider.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../providers/room_provider.dart';
+import '../services/torrent_service.dart';
 import 'room_screen.dart';
+import 'developer_screen.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  final String? arguments;
+  
+  const HomeScreen({super.key, this.arguments});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -23,6 +29,103 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   bool _isCreating = false;
   bool _isJoining = false;
   bool _showSettings = false;
+  bool _isDetecting = false;
+  bool _serverReady = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (widget.arguments != null && widget.arguments!.isNotEmpty) {
+        final code = _extractRoomCode(widget.arguments!);
+        if (code != null) {
+          _roomCodeController.text = code;
+        }
+      }
+      _parseInitialRoute();
+      _detectServerUrl();
+    });
+  }
+
+  Future<void> _detectServerUrl() async {
+    setState(() => _isDetecting = true);
+
+    // Ports to try in order
+    const ports = [3001, 3002];
+
+    try {
+      final torrent = TorrentService();
+      await torrent.checkAndStartSignalServer();
+
+      final tunnelUrl = TorrentService.tunnelUrl;
+      if (tunnelUrl != null) {
+        _serverController.text = tunnelUrl;
+        _serverReady = true;
+        debugPrint('[home] Using tunnel URL: $tunnelUrl');
+        return;
+      }
+
+      // Try each port for a live server
+      for (final port in ports) {
+        try {
+          final response = await http.get(
+            Uri.parse('http://localhost:$port/api/tunnel'),
+          ).timeout(const Duration(seconds: 3));
+          if (response.statusCode == 200) {
+            final data = jsonDecode(response.body);
+            // Server is live — use tunnel URL if available, else localhost
+            final tunnel = data['tunnel'] as String?;
+            if (tunnel != null && tunnel.isNotEmpty) {
+              _serverController.text = tunnel;
+              debugPrint('[home] Auto-detected tunnel URL on port $port: $tunnel');
+            } else {
+              _serverController.text = 'http://localhost:$port';
+              debugPrint('[home] No tunnel — using localhost:$port directly');
+            }
+            _serverReady = true;
+            return;
+          }
+        } catch (_) {
+          // Try next port
+        }
+      }
+
+      debugPrint('[home] No server found on ports $ports — showing button anyway');
+      _serverReady = true; // Let user try anyway
+    } catch (e) {
+      debugPrint('[home] Server detection failed: $e');
+      _serverReady = true; // Don\'t block user
+    } finally {
+      if (mounted) {
+        setState(() => _isDetecting = false);
+      }
+    }
+  }
+
+  void _parseInitialRoute() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final args = ModalRoute.of(context)?.settings.arguments;
+      if (args is String && args.isNotEmpty) {
+        final code = _extractRoomCode(args);
+        if (code != null) {
+          _roomCodeController.text = code;
+        }
+      }
+    });
+  }
+
+  String? _extractRoomCode(String input) {
+    final lower = input.toLowerCase();
+    if (lower.contains('/join/')) {
+      final parts = lower.split('/join/');
+      if (parts.length > 1) {
+        final code = parts[1].replaceAll(RegExp(r'[^a-z0-9]'), '').toUpperCase();
+        return code.isNotEmpty && code.length <= 6 ? code : null;
+      }
+    }
+    final codeOnly = input.replaceAll(RegExp(r'[^a-z0-9]'), '').toUpperCase();
+    return codeOnly.isNotEmpty && codeOnly.length <= 6 ? codeOnly : null;
+  }
 
   @override
   void dispose() {
@@ -56,19 +159,42 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _joinRoom() async {
-    final code = _roomCodeController.text.trim();
-    if (code.isEmpty) {
-      _showError('Enter a room code');
+    final rawInput = _roomCodeController.text.trim();
+    if (rawInput.isEmpty) {
+      _showError('Enter a room code or link');
       return;
     }
+    
     if (_isJoining) return;
     setState(() => _isJoining = true);
 
+    String codeToUse = rawInput;
+    String? explicitServerUrl;
+    
+    // Check if what was pasted is the our formatted link `[ServerUrl]#[RoomCode]`
+    if (rawInput.contains('#')) {
+      final parts = rawInput.split('#');
+      if (parts.length >= 2) {
+        explicitServerUrl = parts[0].trim();
+        codeToUse = parts[1].trim();
+        // Update UI to reflect the parsed values
+        _serverController.text = explicitServerUrl;
+        _roomCodeController.text = codeToUse;
+      }
+    } else {
+      // Just extract code if it's a URL ending in /join/CODE (older format)
+      final extracted = _extractRoomCode(rawInput);
+      if (extracted != null) {
+        codeToUse = extracted;
+        _roomCodeController.text = codeToUse;
+      }
+    }
+
     final provider = context.read<RoomProvider>();
-    provider.setServerUrl(_serverController.text.trim());
+    provider.setServerUrl(explicitServerUrl ?? _serverController.text.trim());
     provider.setUserName(_nameController.text.trim());
 
-    final success = await provider.joinRoom(code);
+    final success = await provider.requestJoin(codeToUse);
 
     if (!mounted) return;
     setState(() => _isJoining = false);
@@ -115,95 +241,113 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final isCompact = screenHeight < 700;
 
     return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            colors: [AppTheme.bgDeep, AppTheme.bgPrimary, Color(0xFF0D0D1E)],
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-          ),
-        ),
-        child: SafeArea(
-          child: Center(
-            child: SingleChildScrollView(
-              padding: EdgeInsets.symmetric(
-                horizontal: AppTheme.spacingLG,
-                vertical: isCompact ? AppTheme.spacingMD : AppTheme.spacingXL,
+      body: Stack(
+        children: [
+          Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [AppTheme.bgDeep, AppTheme.bgPrimary, Color(0xFF0D0D1E)],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
               ),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 440),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    // ─── Logo & Title ───
-                    _buildLogo(),
-                    SizedBox(height: isCompact ? 8 : 12),
-                    _buildTitle(),
-                    SizedBox(height: isCompact ? 4 : 8),
-                    _buildSubtitle(),
-                    SizedBox(height: isCompact ? 24 : 40),
+            ),
+            child: SafeArea(
+              child: Center(
+                child: SingleChildScrollView(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: AppTheme.spacingLG,
+                    vertical: isCompact ? AppTheme.spacingMD : AppTheme.spacingXL,
+                  ),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 440),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        // ─── Logo & Title ───
+                        _buildLogo(),
+                        SizedBox(height: isCompact ? 8 : 12),
+                        _buildTitle(),
+                        SizedBox(height: isCompact ? 4 : 8),
+                        _buildSubtitle(),
+                        SizedBox(height: isCompact ? 24 : 40),
 
-                    // ─── Name Input ───
-                    GlassTextField(
-                      controller: _nameController,
-                      hintText: 'Your display name',
-                      prefixIcon: Icons.person_outline_rounded,
-                      textCapitalization: TextCapitalization.words,
-                    ).animate().fadeIn(delay: 200.ms).slideY(begin: 0.15),
-                    const SizedBox(height: AppTheme.spacingMD),
+                        // ─── Name Input ───
+                        GlassTextField(
+                          controller: _nameController,
+                          hintText: 'Your display name',
+                          prefixIcon: Icons.person_outline_rounded,
+                          textCapitalization: TextCapitalization.words,
+                        ).animate().fadeIn(delay: 200.ms).slideY(begin: 0.15),
+                        const SizedBox(height: AppTheme.spacingMD),
 
-                    // ─── Create Room ───
-                    SizedBox(
-                      width: double.infinity,
-                      child: GradientButton(
-                        label: 'Create Room',
-                        icon: Icons.add_circle_outline_rounded,
-                        isLoading: _isCreating,
-                        onPressed: _createRoom,
-                      ),
-                    ).animate().fadeIn(delay: 300.ms).slideY(begin: 0.15),
-                    const SizedBox(height: AppTheme.spacingLG),
+                        // ─── Create Room ───
+                        SizedBox(
+                          width: double.infinity,
+                          child: GradientButton(
+                            label: _serverReady ? 'Host Room' : 'Starting server...',
+                            icon: _serverReady ? Icons.add_circle_outline_rounded : Icons.hourglass_empty,
+                            isLoading: _isCreating || !_serverReady,
+                            onPressed: _serverReady ? _createRoom : null,
+                          ),
+                        ).animate().fadeIn(delay: 300.ms).slideY(begin: 0.15),
+                        const SizedBox(height: AppTheme.spacingLG),
 
-                    // ─── Divider ───
-                    _buildDivider(),
-                    const SizedBox(height: AppTheme.spacingLG),
+                        // ─── Divider ───
+                        _buildDivider(),
+                        const SizedBox(height: AppTheme.spacingLG),
 
-                    // ─── Join Room ───
-                    GlassTextField(
-                      controller: _roomCodeController,
-                      hintText: 'Room code',
-                      prefixIcon: Icons.tag_rounded,
-                      textCapitalization: TextCapitalization.characters,
-                      textInputAction: TextInputAction.go,
-                      maxLength: 6,
-                      onSubmitted: (_) => _joinRoom(),
-                    ).animate().fadeIn(delay: 400.ms).slideY(begin: 0.15),
-                    const SizedBox(height: AppTheme.spacingMD),
-                    SizedBox(
-                      width: double.infinity,
-                      child: _buildOutlinedButton(
-                        label: 'Join Room',
-                        icon: Icons.login_rounded,
-                        isLoading: _isJoining,
-                        onPressed: _joinRoom,
-                      ),
-                    ).animate().fadeIn(delay: 500.ms).slideY(begin: 0.15),
+                        // ─── Join Room ───
+                        GlassTextField(
+                          controller: _roomCodeController,
+                          hintText: 'Room code',
+                          prefixIcon: Icons.tag_rounded,
+                          textCapitalization: TextCapitalization.characters,
+                          textInputAction: TextInputAction.go,
+                          maxLength: 6,
+                          onSubmitted: (_) => _joinRoom(),
+                        ).animate().fadeIn(delay: 400.ms).slideY(begin: 0.15),
+                        const SizedBox(height: AppTheme.spacingMD),
+                        SizedBox(
+                          width: double.infinity,
+                          child: _buildOutlinedButton(
+                            label: _serverReady ? 'Join Room' : 'Starting server...',
+                            icon: _serverReady ? Icons.login_rounded : Icons.hourglass_empty,
+                            isLoading: _isJoining || !_serverReady,
+                            onPressed: _serverReady ? () => _joinRoom() : () {},
+                          ),
+                        ).animate().fadeIn(delay: 500.ms).slideY(begin: 0.15),
 
-                    const SizedBox(height: AppTheme.spacingXL),
+                        const SizedBox(height: AppTheme.spacingXL),
 
-                    // ─── Settings Toggle ───
-                    _buildSettingsToggle(),
+                        // ─── Settings Toggle ───
+                        _buildSettingsToggle(),
 
-                    if (_showSettings) ...[
-                      const SizedBox(height: AppTheme.spacingMD),
-                      _buildSettingsPanel(),
-                    ],
-                  ],
+                        if (_showSettings) ...[
+                          const SizedBox(height: AppTheme.spacingMD),
+                          _buildSettingsPanel(),
+                        ],
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ),
           ),
-        ),
+          Positioned(
+            top: 16,
+            right: 16,
+            child: IconButton(
+              icon: const Icon(Icons.developer_mode, color: AppTheme.textMuted),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const DeveloperScreen()),
+                );
+              },
+              tooltip: 'Developer Options',
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -351,17 +495,31 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'Server URL',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppTheme.textSecondary,
-                  fontWeight: FontWeight.w600,
+          Row(
+            children: [
+              Text(
+                'Server URL',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: AppTheme.textSecondary,
+                      fontWeight: FontWeight.w600,
+                    ),
+              ),
+              const Spacer(),
+              if (_isDetecting)
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: AppTheme.primary,
+                  ),
                 ),
+            ],
           ),
           const SizedBox(height: 8),
           GlassTextField(
             controller: _serverController,
-            hintText: 'Server URL',
+            hintText: _isDetecting ? 'Detecting server...' : 'Server URL',
             prefixIcon: Icons.dns_outlined,
           ),
         ],

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -23,12 +24,33 @@ class RoomProvider extends ChangeNotifier {
   double _downloadProgress = 0;
   bool _isProcessing = false;
   String _serverUrl = dotenv.env['SERVER_URL'] ?? 'http://localhost:3001';
+  
+  // Join approval state
+  bool _joinPending = false;
+  bool _joinApproved = false;
+  bool _joinRejected = false;
+
+  // Sync heartbeat
+  Timer? _syncTimer;
+  final Map<String, double> _viewerDrifts = {};
+  static const double _maxDriftSeconds = 2.0;
 
   RoomProvider() {
     _webrtc = WebRTCService(_socket);
 
     // Listen for incoming magnet URIs from other participants
     _socket.onTorrentMagnet = _onTorrentMagnet;
+    
+    // Join approval callbacks
+    _socket.onJoinRequest = _onJoinRequest;
+    _socket.onJoinApproved = _onJoinApproved;
+    _socket.onJoinRejected = _onJoinRejected;
+    _socket.onJoinPending = _onJoinPending;
+
+    // Sync callbacks
+    _socket.onSyncCheck = _onSyncCheck;
+    _socket.onSyncReport = _onSyncReport;
+    _socket.onSyncCorrect = _onSyncCorrect;
   }
 
   // ─── Getters ───
@@ -50,6 +72,11 @@ class RoomProvider extends ChangeNotifier {
   ValueNotifier<List<Participant>> get participants => _socket.participants;
   ValueNotifier<List<ChatMessage>> get messages => _socket.messages;
   ValueNotifier<bool> get connected => _socket.connected;
+  
+  // Join approval getters
+  bool get joinPending => _joinPending;
+  bool get joinApproved => _joinApproved;
+  bool get joinRejected => _joinRejected;
 
   void setServerUrl(String url) {
     _serverUrl = url;
@@ -67,27 +94,46 @@ class RoomProvider extends ChangeNotifier {
     _isHost = true;
     notifyListeners();
 
+    debugPrint('[room] createRoom() → connecting to $_serverUrl');
     _socket.connect(_serverUrl);
 
-    // Wait for connection
+    // Wait for connection (polling transport through Cloudflare can take 3-5s)
     await Future.delayed(const Duration(milliseconds: 500));
     int retries = 0;
-    while (!_socket.isConnected && retries < 10) {
+    while (!_socket.isConnected && retries < 20) {
+      debugPrint('[room] Waiting for connection... attempt ${retries + 1}/20 (connected=${_socket.isConnected})');
       await Future.delayed(const Duration(milliseconds: 300));
       retries++;
     }
 
     if (!_socket.isConnected) {
-      _error = 'Could not connect to server';
+      debugPrint('[room] ❌ Failed to connect after ${retries * 300 + 500}ms. Check that the server is running on $_serverUrl');
+      _error = 'Could not connect to server at $_serverUrl';
       notifyListeners();
       return '';
     }
 
+    debugPrint('[room] ✅ Connected — emitting create-room for user: $_userName');
     _socket.createRoom(name: _userName);
 
-    // Wait for room code to be assigned
-    await Future.delayed(const Duration(milliseconds: 500));
+    // Wait for room-created event (Go server emits it as a separate event)
+    int roomRetries = 0;
+    while (_socket.currentRoom == null && roomRetries < 20) {
+      if (roomRetries % 5 == 0) {
+        debugPrint('[room] Waiting for room-created event... attempt ${roomRetries + 1}/20');
+      }
+      await Future.delayed(const Duration(milliseconds: 150));
+      roomRetries++;
+    }
+    
     _roomCode = _socket.currentRoom;
+    if (_roomCode == null || _roomCode!.isEmpty) {
+      debugPrint('[room] ❌ No room-created event received after ${roomRetries * 150}ms. The server may be rejecting the event.');
+      _error = 'Failed to create room — no response from server';
+      notifyListeners();
+      return '';
+    }
+    debugPrint('[room] ✅ Room created: $_roomCode');
     _inRoom = true;
     notifyListeners();
     return _roomCode ?? '';
@@ -121,7 +167,92 @@ class RoomProvider extends ChangeNotifier {
     return true;
   }
 
+  /// Request to join a room (sends join request, waits for approval)
+  Future<bool> requestJoin(String code) async {
+    _error = null;
+    _joinPending = false;
+    _joinApproved = false;
+    _joinRejected = false;
+    _roomCode = code.toUpperCase().trim();
+    _isHost = false;
+    notifyListeners();
+
+    _socket.connect(_serverUrl);
+
+    await Future.delayed(const Duration(milliseconds: 500));
+    int retries = 0;
+    while (!_socket.isConnected && retries < 10) {
+      await Future.delayed(const Duration(milliseconds: 300));
+      retries++;
+    }
+
+    if (!_socket.isConnected) {
+      _error = 'Could not connect to server';
+      notifyListeners();
+      return false;
+    }
+
+    _socket.joinRequest(_roomCode!, _userName);
+    _inRoom = true;
+    notifyListeners();
+    return true;
+  }
+
+  /// Host approves a viewer join request
+  void approveJoin(String participantId) {
+    _socket.approveJoin(participantId);
+  }
+
+  /// Host rejects a viewer join request
+  void rejectJoin(String participantId) {
+    _socket.rejectJoin(participantId);
+  }
+
+  /// Viewer polls for join approval status
+  void pollJoinStatus() {
+    _socket.requestJoinApproval();
+  }
+
+  void _onJoinRequest(String participantId, String name) {
+    debugPrint('[room] Join request from: $name ($participantId)');
+    notifyListeners();
+  }
+
+  void _onJoinApproved(String participantId) {
+    _joinPending = false;
+    _joinApproved = true;
+    _joinRejected = false;
+    debugPrint('[room] Join approved');
+    notifyListeners();
+  }
+
+  void _onJoinRejected() {
+    _joinPending = false;
+    _joinApproved = false;
+    _joinRejected = true;
+    _error = 'Join request was rejected by host';
+    debugPrint('[room] Join rejected');
+    notifyListeners();
+  }
+
+  void _onJoinPending() {
+    _joinPending = true;
+    _joinApproved = false;
+    _joinRejected = false;
+    debugPrint('[room] Join pending - waiting for approval');
+    notifyListeners();
+  }
+
+  void resetJoinState() {
+    _joinPending = false;
+    _joinApproved = false;
+    _joinRejected = false;
+    notifyListeners();
+  }
+
   void leaveRoom() {
+    _stopSyncHeartbeat();
+    _viewerDrifts.clear();
     _webrtc.stopCall();
     _torrent.stop();
     _socket.leaveRoom();
@@ -133,6 +264,7 @@ class RoomProvider extends ChangeNotifier {
     _isStreaming = false;
     _downloadProgress = 0;
     _isProcessing = false;
+    resetJoinState();
     notifyListeners();
   }
 
@@ -175,10 +307,18 @@ class RoomProvider extends ChangeNotifier {
     _isProcessing = false;
     if (serverUrl != null) {
       _isStreaming = true;
+      if (_isHost) {
+        _startSyncHeartbeat();
+      }
       // Share magnet URI with other participants
       final magnet = _torrent.magnetUri.value;
       if (magnet != null) {
-        _socket.shareMagnet(magnet, 'direct', fileName);
+        // Validate magnet before sharing
+        if (!magnet.startsWith('magnet:?') || !magnet.contains('xt=urn:btih:')) {
+          debugPrint('[room] Invalid magnet URI generated, skipping share');
+        } else {
+          _socket.shareMagnet(magnet, 'direct', fileName);
+        }
         _socket.emitMovieLoaded(fileName, 0);
       }
     } else {
@@ -192,6 +332,22 @@ class RoomProvider extends ChangeNotifier {
   void _onTorrentMagnet(String magnet, String streamPath) async {
     if (_isHost) return; // Host already has the file
 
+    // Validate magnet URI
+    if (!magnet.startsWith('magnet:?') || !magnet.contains('xt=urn:btih:')) {
+      debugPrint('[room] Received invalid magnet URI, ignoring');
+      _error = 'Received invalid magnet link';
+      notifyListeners();
+      return;
+    }
+
+    // Mobile viewers can't run local engine
+    if (_torrent.isMobile) {
+      debugPrint('[room] Mobile viewer — streaming not yet supported');
+      _error = 'Mobile streaming coming soon';
+      notifyListeners();
+      return;
+    }
+
     if (!Platform.isWindows && !Platform.isMacOS && !Platform.isLinux) {
       debugPrint('[room] Torrent streaming not available on this platform');
       return;
@@ -201,13 +357,20 @@ class RoomProvider extends ChangeNotifier {
     _isStreaming = false;
     notifyListeners();
 
-    final serverUrl = await _torrent.download(magnet);
+    try {
+      final serverUrl = await _torrent.download(magnet);
 
-    _isProcessing = false;
-    if (serverUrl != null) {
-      _isStreaming = true;
-    } else {
-      _error = _torrent.lastError.value ?? 'Failed to download torrent';
+      _isProcessing = false;
+      if (serverUrl != null) {
+        _isStreaming = true;
+        _startSyncHeartbeat();
+      } else {
+        _error = _torrent.lastError.value ?? 'Failed to download torrent';
+      }
+    } catch (e) {
+      _isProcessing = false;
+      _error = 'Torrent download failed: $e';
+      debugPrint('[room] Torrent download error: $e');
     }
     notifyListeners();
   }
@@ -238,8 +401,51 @@ class RoomProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ─── Sync Heartbeat ───
+
+  void _startSyncHeartbeat() {
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      _triggerSyncCheck();
+    });
+    debugPrint('[room] Started sync heartbeat (15s interval)');
+  }
+
+  void _stopSyncHeartbeat() {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    debugPrint('[room] Stopped sync heartbeat');
+  }
+
+  void _triggerSyncCheck() {
+    if (_roomCode == null) return;
+    _socket.syncCheck(_roomCode!);
+  }
+
+  void _onSyncCheck(int timestamp) {
+    if (_roomCode == null) return;
+    debugPrint('[room] Received sync-check from host, responding with report');
+    _socket.syncReport(_roomCode!, 0, true, 0);
+  }
+
+  void _onSyncReport(String participantId, double playbackTime, bool playing) {
+    if (!_isHost || _roomCode == null) return;
+    final drift = playbackTime;
+    _viewerDrifts[participantId] = drift;
+    debugPrint('[room] Sync report from $participantId: drift=${drift.toStringAsFixed(2)}s');
+    if (drift.abs() > _maxDriftSeconds) {
+      debugPrint('[room] Correcting $participantId (drift: ${drift.toStringAsFixed(2)}s)');
+      _socket.syncCorrect(participantId, 0, playing);
+    }
+  }
+
+  void _onSyncCorrect(double time, bool playing, String actionId) {
+    debugPrint('[room] Received sync-correct: time=$time, playing=$playing');
+  }
+
   @override
   void dispose() {
+    _stopSyncHeartbeat();
     _webrtc.dispose();
     _torrent.dispose();
     _socket.dispose();
