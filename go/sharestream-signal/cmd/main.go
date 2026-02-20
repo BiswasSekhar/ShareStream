@@ -234,8 +234,18 @@ func registerEventHandlers(client *socket.Socket) {
 		handleTargetedEmit(client, "ice-candidate", data)
 	})
 	client.On("ready-for-connection", func(args ...any) {
-		data := parseData(args)
-		handleBroadcastToRooms(client, "ready-for-connection", data)
+		// When a client is ready, notify all other participants to start WebRTC
+		for _, room := range client.Rooms().Keys() {
+			if room == socket.Room(client.Id()) {
+				continue
+			}
+			// Broadcast to room that this client is ready to connect
+			client.To(room).Emit("start-webrtc", map[string]interface{}{
+				"peerId":    client.Id(),
+				"initiator": true, // Existing participants initiate the connection
+			})
+			log.Printf("[webrtc] Notified room %s that %s is ready for connection", room, client.Id())
+		}
 	})
 	client.On("chat-message", func(args ...any) {
 		data := parseData(args)
@@ -550,11 +560,19 @@ func handleRequestJoinApproval(s *socket.Socket, data map[string]interface{}) {
 // handleBroadcastToRooms broadcasts an event to all rooms the socket is in
 // (excluding the socket's own ID room).
 func handleBroadcastToRooms(s *socket.Socket, event string, data map[string]interface{}) {
-	log.Printf("%s: %+v", event, data)
-	for _, room := range s.Rooms().Keys() {
-		if room != socket.Room(s.Id()) {
-			io_.To(room).Emit(event, data)
+	log.Printf("[broadcast] %s from %s: %+v", event, s.Id(), data)
+	rooms := s.Rooms().Keys()
+	if len(rooms) == 0 {
+		log.Printf("[broadcast] Warning: socket %s is not in any rooms", s.Id())
+		return
+	}
+	for _, room := range rooms {
+		// Skip the socket's personal ID room (if it exists)
+		if room == socket.Room(s.Id()) {
+			continue
 		}
+		log.Printf("[broadcast] Emitting %s to room %s", event, room)
+		io_.To(room).Emit(event, data)
 	}
 }
 

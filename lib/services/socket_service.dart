@@ -52,6 +52,15 @@ class SocketService {
   bool get isConnected => connected.value;
 
   void connect(String serverUrl) {
+    // If already connected to a different URL, disconnect first
+    if (_socket != null) {
+      debugPrint('[socket] Cleaning up previous connection before connecting to: $serverUrl');
+      _socket!.disconnect();
+      _socket!.dispose();
+      _socket = null;
+      connected.value = false;
+    }
+    
     debugPrint('[socket] Connecting to: $serverUrl');
     debugPrint('[socket] Transport: websocket');
     
@@ -246,18 +255,28 @@ class SocketService {
       }
     });
 
-    // Chat Events
+    // Chat Events - with deduplication
     _socket!.on('chat-message', (data) {
+      final msgId = data['id'] ?? '';
+      final senderId = data['senderId'] ?? '';
+      
+      // Check for duplicate message
+      final isDuplicate = messages.value.any((m) => m.id == msgId);
+      if (isDuplicate) {
+        debugPrint('[socket] Duplicate chat message ignored: $msgId');
+        return;
+      }
+      
       final msg = ChatMessage(
-        id: data['id'] ?? '',
-        senderId: data['senderId'] ?? '',
+        id: msgId,
+        senderId: senderId,
         senderName: data['sender'] ?? 'Unknown',
         senderRole: data['senderRole'] ?? 'viewer',
         text: data['text'] ?? '',
         timestamp: DateTime.fromMillisecondsSinceEpoch(
           (data['timestamp'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
         ),
-        isMe: data['senderId'] == _userId,
+        isMe: senderId == _userId,
       );
       messages.value = [...messages.value, msg];
     });
@@ -475,7 +494,12 @@ class SocketService {
 
   // Chat
   void sendMessage(String text) {
-    _socket?.emit('chat-message', {'text': text});
+    // Generate client-side message ID for deduplication
+    final msgId = '${_userId}_${DateTime.now().millisecondsSinceEpoch}';
+    _socket?.emit('chat-message', {
+      'text': text,
+      'clientId': msgId,
+    });
   }
 
   // Playback Readiness

@@ -47,7 +47,15 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     });
   }
 
+  bool _hasExplicitServerUrl = false;
+
   Future<void> _detectServerUrl() async {
+    // Skip auto-detection if user already provided an explicit server URL
+    if (_hasExplicitServerUrl) {
+      debugPrint('[home] Skipping auto-detection, explicit URL already set');
+      return;
+    }
+
     setState(() => _isDetecting = true);
 
     // Ports to try in order
@@ -171,18 +179,54 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     String codeToUse = rawInput;
     String? explicitServerUrl;
     
-    // Check if what was pasted is the our formatted link `[ServerUrl]#[RoomCode]`
+    // Check if input contains '#' separator for ServerURL#RoomCode format
     if (rawInput.contains('#')) {
       final parts = rawInput.split('#');
       if (parts.length >= 2) {
         explicitServerUrl = parts[0].trim();
-        codeToUse = parts[1].trim();
+        codeToUse = parts[1].trim().toUpperCase();
+        _hasExplicitServerUrl = true;
         // Update UI to reflect the parsed values
-        _serverController.text = explicitServerUrl;
-        _roomCodeController.text = codeToUse;
+        setState(() {
+          _serverController.text = explicitServerUrl!;
+          _roomCodeController.text = codeToUse;
+        });
+        debugPrint('[home] Parsed explicit server URL from link: $explicitServerUrl');
+      }
+    } else if (rawInput.toLowerCase().startsWith('http')) {
+      // Handle URL without # - try to extract room code from query params or path
+      try {
+        final uri = Uri.parse(rawInput);
+        // Check for room param in query
+        final roomParam = uri.queryParameters['room'];
+        if (roomParam != null && roomParam.isNotEmpty) {
+          explicitServerUrl = '${uri.scheme}://${uri.host}${uri.port != 0 ? ':${uri.port}' : ''}';
+          codeToUse = roomParam.toUpperCase();
+          _hasExplicitServerUrl = true;
+          setState(() {
+            _serverController.text = explicitServerUrl!;
+            _roomCodeController.text = codeToUse;
+          });
+          debugPrint('[home] Parsed server URL from query param: $explicitServerUrl');
+        } else {
+          // Extract code from /join/CODE path
+          final extracted = _extractRoomCode(rawInput);
+          if (extracted != null) {
+            explicitServerUrl = '${uri.scheme}://${uri.host}${uri.port != 0 ? ':${uri.port}' : ''}';
+            codeToUse = extracted;
+            _hasExplicitServerUrl = true;
+            setState(() {
+              _serverController.text = explicitServerUrl!;
+              _roomCodeController.text = codeToUse;
+            });
+            debugPrint('[home] Parsed server URL from path: $explicitServerUrl');
+          }
+        }
+      } catch (_) {
+        // Not a valid URL, treat as room code
       }
     } else {
-      // Just extract code if it's a URL ending in /join/CODE (older format)
+      // Just extract code if it's a simple code or /join/CODE format
       final extracted = _extractRoomCode(rawInput);
       if (extracted != null) {
         codeToUse = extracted;
@@ -191,7 +235,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     }
 
     final provider = context.read<RoomProvider>();
-    provider.setServerUrl(explicitServerUrl ?? _serverController.text.trim());
+    final serverUrlToUse = explicitServerUrl ?? _serverController.text.trim();
+    debugPrint('[home] Joining with server URL: $serverUrlToUse, room: $codeToUse');
+    provider.setServerUrl(serverUrlToUse);
     provider.setUserName(_nameController.text.trim());
 
     final success = await provider.requestJoin(codeToUse);
@@ -299,11 +345,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                         // ─── Join Room ───
                         GlassTextField(
                           controller: _roomCodeController,
-                          hintText: 'Room code',
+                          hintText: 'Room code or paste link',
                           prefixIcon: Icons.tag_rounded,
                           textCapitalization: TextCapitalization.characters,
                           textInputAction: TextInputAction.go,
-                          maxLength: 6,
                           onSubmitted: (_) => _joinRoom(),
                         ).animate().fadeIn(delay: 400.ms).slideY(begin: 0.15),
                         const SizedBox(height: AppTheme.spacingMD),
