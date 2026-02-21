@@ -323,51 +323,126 @@ func (h *Handler) HandleStartWebRTC(conn socketio.Conn, data map[string]interfac
 }
 
 func (h *Handler) HandleOffer(conn socketio.Conn, data map[string]interface{}) {
-	to, _ := data["to"].(string)
+	toPeerID, _ := data["to"].(string)
 	offer, _ := data["offer"].(map[string]interface{})
 
-	for _, room := range conn.Rooms() {
-		if room != conn.ID() {
-			h.server.BroadcastToRoom("/", room, "offer", map[string]interface{}{
-				"from":  conn.ID(),
-				"offer": offer,
-			})
+	if toPeerID == "" {
+		log.Printf("Offer from %s missing 'to' field, ignoring", conn.ID())
+		return
+	}
+
+	// Find the target participant's socket ID and send directly
+	sent := false
+	for _, roomCode := range conn.Rooms() {
+		room, exists := h.rooms.GetRoom(roomCode)
+		if !exists {
+			continue
+		}
+
+		room.Mu.RLock()
+		for _, p := range room.Participants {
+			if p.ID == toPeerID {
+				// Send directly to the target socket
+				h.server.EmitTo(p.SocketID, "offer", map[string]interface{}{
+					"from":  conn.ID(),
+					"offer": offer,
+				})
+				sent = true
+				log.Printf("Offer sent from %s to %s (socket: %s, room: %s)", conn.ID(), toPeerID, p.SocketID, roomCode)
+				break
+			}
+		}
+		room.Mu.RUnlock()
+		if sent {
+			break
 		}
 	}
 
-	log.Printf("Offer sent from %s to %s", conn.ID(), to)
+	if !sent {
+		log.Printf("Failed to send offer from %s to %s: target not found", conn.ID(), toPeerID)
+	}
 }
 
 func (h *Handler) HandleAnswer(conn socketio.Conn, data map[string]interface{}) {
-	to, _ := data["to"].(string)
+	toPeerID, _ := data["to"].(string)
 	answer, _ := data["answer"].(map[string]interface{})
 
-	for _, room := range conn.Rooms() {
-		if room != conn.ID() {
-			h.server.BroadcastToRoom("/", room, "answer", map[string]interface{}{
-				"from":   conn.ID(),
-				"answer": answer,
-			})
+	if toPeerID == "" {
+		log.Printf("Answer from %s missing 'to' field, ignoring", conn.ID())
+		return
+	}
+
+	// Find the target participant's socket ID and send directly
+	sent := false
+	for _, roomCode := range conn.Rooms() {
+		room, exists := h.rooms.GetRoom(roomCode)
+		if !exists {
+			continue
+		}
+
+		room.Mu.RLock()
+		for _, p := range room.Participants {
+			if p.ID == toPeerID {
+				// Send directly to the target socket
+				h.server.EmitTo(p.SocketID, "answer", map[string]interface{}{
+					"from":   conn.ID(),
+					"answer": answer,
+				})
+				sent = true
+				log.Printf("Answer sent from %s to %s (socket: %s, room: %s)", conn.ID(), toPeerID, p.SocketID, roomCode)
+				break
+			}
+		}
+		room.Mu.RUnlock()
+		if sent {
+			break
 		}
 	}
 
-	log.Printf("Answer sent from %s to %s", conn.ID(), to)
+	if !sent {
+		log.Printf("Failed to send answer from %s to %s: target not found", conn.ID(), toPeerID)
+	}
 }
 
 func (h *Handler) HandleICECandidate(conn socketio.Conn, data map[string]interface{}) {
-	to, _ := data["to"].(string)
+	toPeerID, _ := data["to"].(string)
 	candidate, _ := data["candidate"].(map[string]interface{})
 
-	for _, room := range conn.Rooms() {
-		if room != conn.ID() {
-			h.server.BroadcastToRoom("/", room, "ice-candidate", map[string]interface{}{
-				"from":      conn.ID(),
-				"candidate": candidate,
-			})
+	if toPeerID == "" {
+		log.Printf("ICE candidate from %s missing 'to' field, ignoring", conn.ID())
+		return
+	}
+
+	// Find the target participant's socket ID and send directly
+	sent := false
+	for _, roomCode := range conn.Rooms() {
+		room, exists := h.rooms.GetRoom(roomCode)
+		if !exists {
+			continue
+		}
+
+		room.Mu.RLock()
+		for _, p := range room.Participants {
+			if p.ID == toPeerID {
+				// Send directly to the target socket
+				h.server.EmitTo(p.SocketID, "ice-candidate", map[string]interface{}{
+					"from":      conn.ID(),
+					"candidate": candidate,
+				})
+				sent = true
+				// Don't log every ICE candidate to avoid spam
+				break
+			}
+		}
+		room.Mu.RUnlock()
+		if sent {
+			break
 		}
 	}
 
-	log.Printf("ICE candidate sent from %s to %s", conn.ID(), to)
+	if !sent {
+		log.Printf("Failed to send ICE candidate from %s to %s: target not found", conn.ID(), toPeerID)
+	}
 }
 
 func (h *Handler) HandleSyncCheck(conn socketio.Conn, data map[string]interface{}) {

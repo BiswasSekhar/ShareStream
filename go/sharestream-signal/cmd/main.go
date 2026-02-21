@@ -32,6 +32,11 @@ var (
 	io_       *socket.Server
 	tunnelURL string
 	tunnelMu  sync.RWMutex
+	
+	// Socket to participant ID mapping for WebRTC signaling
+	socketToParticipant = make(map[string]string)
+	participantToSocket = make(map[string]string)
+	participantMu       sync.RWMutex
 )
 
 // ── Room Management ──────────────────────────────────────────────────────────
@@ -119,6 +124,17 @@ func main() {
 				reason = fmt.Sprintf("%v", args[0])
 			}
 			log.Printf("Client disconnected: %s (reason: %s)", client.Id(), reason)
+			
+			// Clean up participant mapping
+			participantMu.Lock()
+			participantID := socketToParticipant[string(client.Id())]
+			delete(socketToParticipant, string(client.Id()))
+			delete(participantToSocket, participantID)
+			participantMu.Unlock()
+			
+			if participantID != "" {
+				log.Printf("[JOIN] Cleaned up mapping for participant %s", participantID)
+			}
 		})
 	})
 
@@ -195,6 +211,13 @@ func registerEventHandlers(client *socket.Socket) {
 		participantID, ok := data["participantId"].(string)
 		if ok && participantID != "" {
 			client.Join(socket.Room(participantID))
+			
+			// Store the mapping
+			participantMu.Lock()
+			socketToParticipant[string(client.Id())] = participantID
+			participantToSocket[participantID] = string(client.Id())
+			participantMu.Unlock()
+			
 			log.Printf("[JOIN] Client %s registered as participant %s", client.Id(), participantID)
 		}
 	})
@@ -243,17 +266,48 @@ func registerEventHandlers(client *socket.Socket) {
 		handleTargetedEmit(client, "ice-candidate", data)
 	})
 	client.On("ready-for-connection", func(args ...any) {
+		// Get our participant ID
+		participantMu.RLock()
+		myParticipantID := socketToParticipant[string(client.Id())]
+		participantMu.RUnlock()
+		
+		if myParticipantID == "" {
+			log.Printf("[webrtc] Warning: client %s not registered, using socket ID", client.Id())
+			myParticipantID = string(client.Id())
+		}
+		
 		// When a client is ready, notify all other participants to start WebRTC
 		for _, room := range client.Rooms().Keys() {
-			if room == socket.Room(client.Id()) {
+			// Skip the client's own socket room and participant room
+			if room == socket.Room(client.Id()) || room == socket.Room(myParticipantID) {
 				continue
 			}
-			// Broadcast to room that this client is ready to connect
-			client.To(room).Emit("start-webrtc", map[string]interface{}{
-				"peerId":    client.Id(),
-				"initiator": true, // Existing participants initiate the connection
-			})
-			log.Printf("[webrtc] Notified room %s that %s is ready for connection", room, client.Id())
+			
+			// Get the room to find participants
+			r := roomManager.GetRoom(string(room))
+			if r == nil {
+				continue
+			}
+			
+			// Notify each participant in the room
+			r.mu.RLock()
+			for participantID := range r.Approved {
+				if participantID == myParticipantID {
+					continue // Don't notify ourselves
+				}
+				
+				// Determine who is the initiator based on ID comparison
+				// The peer with lexicographically smaller ID initiates
+				isInitiator := myParticipantID < participantID
+				
+				// Send to the participant's room
+				io_.To(socket.Room(participantID)).Emit("start-webrtc", map[string]interface{}{
+					"peerId":    myParticipantID,
+					"initiator": isInitiator,
+				})
+				log.Printf("[webrtc] Notified %s about %s (initiator: %v)", participantID, myParticipantID, isInitiator)
+			}
+			r.mu.RUnlock()
 		}
 	})
 	client.On("chat-message", func(args ...any) {
@@ -611,9 +665,20 @@ func handleTargetedEmit(s *socket.Socket, event string, data map[string]interfac
 			return
 		}
 	}
-	// Add sender's socket ID so receiver knows who sent it
-	data["from"] = string(s.Id())
-	log.Printf("[targeted] Forwarding %s to %s", event, targetID)
+	
+	// Get sender's participant ID for WebRTC signaling
+	participantMu.RLock()
+	senderParticipantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+	
+	// Use participant ID if available, otherwise fall back to socket ID
+	if senderParticipantID != "" {
+		data["from"] = senderParticipantID
+	} else {
+		data["from"] = string(s.Id())
+	}
+	
+	log.Printf("[targeted] Forwarding %s to %s (from: %s)", event, targetID, data["from"])
 	io_.To(socket.Room(targetID)).Emit(event, data)
 }
 

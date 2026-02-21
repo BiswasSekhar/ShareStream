@@ -126,19 +126,7 @@ class SocketService {
       }
     });
 
-    _socket!.on('participant-joined', (data) {
-      final id = data['id'] as String? ?? '';
-      final name = data['name'] as String? ?? 'Unknown';
-      debugPrint('[socket] Participant joined: $name ($id)');
-      if (id.isNotEmpty) {
-        final current = List<Participant>.from(participants.value);
-        if (!current.any((p) => p.id == id)) {
-          current.add(Participant(id: id, name: name, role: 'viewer'));
-          participants.value = current;
-          debugPrint('[socket] Participants list updated: ${current.length} total');
-        }
-      }
-    });
+
 
     _socket!.on('participant-left', (data) {
       final leftId = data['id'] as String?;
@@ -161,11 +149,34 @@ class SocketService {
         onStartWebRTC?.call(peerId, initiator);
       }
     });
+    
+    // Notify when a new participant joins to start WebRTC
+    _socket!.on('participant-joined', (data) {
+      final id = data['id'] as String? ?? '';
+      final name = data['name'] as String? ?? 'Unknown';
+      debugPrint('[socket] Participant joined: $name ($id)');
+      if (id.isNotEmpty) {
+        final current = List<Participant>.from(participants.value);
+        if (!current.any((p) => p.id == id)) {
+          current.add(Participant(id: id, name: name, role: 'viewer'));
+          participants.value = current;
+          debugPrint('[socket] Participants list updated: ${current.length} total');
+        }
+        
+        // Trigger WebRTC connection to new peer
+        // We are the initiator if our ID is lexicographically smaller
+        final myId = _participantId ?? _userId ?? '';
+        final imInitiator = myId.compareTo(id) < 0;
+        debugPrint('[socket] Triggering WebRTC with $id, initiator: $imInitiator');
+        onStartWebRTC?.call(id, imInitiator);
+      }
+    });
 
     _socket!.on('offer', (data) {
       final from = data['from'] as String?;
       final offer = data['offer'];
       if (from != null && offer != null) {
+        debugPrint('[socket] Received offer from $from');
         onOffer?.call(from, Map<String, dynamic>.from(offer));
       }
     });
@@ -174,6 +185,7 @@ class SocketService {
       final from = data['from'] as String?;
       final answer = data['answer'];
       if (from != null && answer != null) {
+        debugPrint('[socket] Received answer from $from');
         onAnswer?.call(from, Map<String, dynamic>.from(answer));
       }
     });
