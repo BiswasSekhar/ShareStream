@@ -190,13 +190,14 @@ class TorrentService {
   }
 
   Future<String?> _findSignalPath() async {
+    // Extensionless first (macOS/Linux), then .exe (Windows)
     final candidates = [
-      'C:/Users/biswa/ShareStream/go/sharestream-signal/sharestream-signal.exe',
       'C:/Users/biswa/ShareStream/go/sharestream-signal/sharestream-signal',
-      '${Directory.current.path}/go/sharestream-signal/sharestream-signal.exe',
+      'C:/Users/biswa/ShareStream/go/sharestream-signal/sharestream-signal.exe',
       '${Directory.current.path}/go/sharestream-signal/sharestream-signal',
-      '${File(Platform.resolvedExecutable).parent.path}/sharestream-signal.exe',
+      '${Directory.current.path}/go/sharestream-signal/sharestream-signal.exe',
       '${File(Platform.resolvedExecutable).parent.path}/sharestream-signal',
+      '${File(Platform.resolvedExecutable).parent.path}/sharestream-signal.exe',
     ];
 
     // Add home-directory based path (macOS sandbox workaround)
