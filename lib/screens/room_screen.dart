@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' as webrtc;
 import 'package:file_picker/file_picker.dart';
 import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
@@ -344,16 +345,21 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
               ),
           ],
         ),
-        // Video call PIP overlay
+        // Video call PIP overlay — show when in call OR receiving remote video
         ValueListenableBuilder<bool>(
           valueListenable: provider.webrtc.isInCall,
           builder: (_, inCall, __) {
-            if (!inCall) return const SizedBox.shrink();
-            return VideoCallOverlay(
-              webrtcService: provider.webrtc,
-              onEndCall: () async {
-                await provider.endCall();
-                if (mounted) setState(() {});
+            return ValueListenableBuilder<Map<String, webrtc.MediaStream>>(
+              valueListenable: provider.webrtc.remoteStreams,
+              builder: (_, streams, __) {
+                if (!inCall && streams.isEmpty) return const SizedBox.shrink();
+                return VideoCallOverlay(
+                  webrtcService: provider.webrtc,
+                  onEndCall: () async {
+                    await provider.endCall();
+                    if (mounted) setState(() {});
+                  },
+                );
               },
             );
           },
