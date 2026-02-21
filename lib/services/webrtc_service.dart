@@ -20,6 +20,7 @@ class WebRTCService {
 
   final Map<String, webrtc.RTCPeerConnection> _peers = {};
   final Map<String, webrtc.MediaStream> _remoteStreams = {};
+  final List<Map<String, dynamic>> _pendingPeers = []; // Queued start-webrtc events
 
   final ValueNotifier<bool> isInCall = ValueNotifier(false);
   final ValueNotifier<bool> audioEnabled = ValueNotifier(true);
@@ -56,7 +57,12 @@ class WebRTCService {
   }
 
   void _onStartWebRTC(String peerId, bool initiator) {
-    if (!isInCall.value) return;
+    if (!isInCall.value) {
+      // Queue the peer for when user starts their call
+      debugPrint('[webrtc] Queuing pending peer: $peerId (not in call yet)');
+      _pendingPeers.add({'peerId': peerId, 'initiator': initiator});
+      return;
+    }
     _createPeerConnection(peerId, initiator: initiator);
   }
 
@@ -86,6 +92,15 @@ class WebRTCService {
       isInCall.value = true;
 
       _socket.emit('ready-for-connection', {});
+
+      // Process any queued start-webrtc events from peers who started before us
+      for (final pending in _pendingPeers) {
+        final peerId = pending['peerId'] as String;
+        final initiator = pending['initiator'] as bool;
+        debugPrint('[webrtc] Processing pending peer: $peerId');
+        _createPeerConnection(peerId, initiator: initiator);
+      }
+      _pendingPeers.clear();
 
       debugPrint('[webrtc] call started, local stream ready');
     } catch (e) {

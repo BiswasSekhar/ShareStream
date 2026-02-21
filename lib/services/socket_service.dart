@@ -289,6 +289,14 @@ class SocketService {
           ? msgId 
           : '${senderId}_${DateTime.now().millisecondsSinceEpoch}';
       
+      final isMe = senderId == _userId || senderId == _participantId;
+      
+      // Skip messages we sent ourselves (already added locally)
+      if (isMe) {
+        debugPrint('[socket] Skipping own chat message echo');
+        return;
+      }
+      
       final msg = ChatMessage(
         id: effectiveId,
         senderId: senderId,
@@ -298,7 +306,7 @@ class SocketService {
         timestamp: DateTime.fromMillisecondsSinceEpoch(
           (data['timestamp'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
         ),
-        isMe: senderId == _userId,
+        isMe: false,
       );
       messages.value = [...messages.value, msg];
     });
@@ -538,11 +546,29 @@ class SocketService {
   // Chat
   void sendMessage(String text) {
     // Generate client-side message ID for deduplication
-    final msgId = '${_userId}_${DateTime.now().millisecondsSinceEpoch}';
+    final msgId = '${_participantId}_${DateTime.now().millisecondsSinceEpoch}';
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    
     _socket?.emit('chat-message', {
       'text': text,
-      'clientId': msgId,
+      'id': msgId,
+      'senderId': _participantId ?? _userId ?? '',
+      'sender': _userName,
+      'senderRole': _isHost ? 'host' : 'viewer',
+      'timestamp': timestamp,
     });
+    
+    // Add to local messages immediately (sender doesn't wait for echo)
+    final msg = ChatMessage(
+      id: msgId,
+      senderId: _participantId ?? _userId ?? '',
+      senderName: _userName,
+      senderRole: _isHost ? 'host' : 'viewer',
+      text: text,
+      timestamp: DateTime.fromMillisecondsSinceEpoch(timestamp),
+      isMe: true,
+    );
+    messages.value = [...messages.value, msg];
   }
 
   // Playback Readiness
