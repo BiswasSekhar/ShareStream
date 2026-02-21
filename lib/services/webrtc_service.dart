@@ -55,12 +55,8 @@ class WebRTCService {
     _socket.onPeerLeft = removePeer;
   }
 
-  Future<void> _onStartWebRTC(String peerId, bool initiator) async {
-    // Auto-start the call if not already in one (peer initiated)
-    if (!isInCall.value) {
-      debugPrint('[webrtc] Auto-starting call (triggered by peer $peerId)');
-      await startCall();
-    }
+  void _onStartWebRTC(String peerId, bool initiator) {
+    if (!isInCall.value) return;
     _createPeerConnection(peerId, initiator: initiator);
   }
 
@@ -206,11 +202,7 @@ class WebRTCService {
   }
 
   Future<void> handleOffer(String fromId, Map<String, dynamic> offerMap) async {
-    // Auto-start the call if not already in one (peer sent offer)
-    if (!isInCall.value) {
-      debugPrint('[webrtc] Auto-starting call (received offer from $fromId)');
-      await startCall();
-    }
+    if (!isInCall.value) return;
 
     if (!_peers.containsKey(fromId)) {
       await _createPeerConnection(fromId, initiator: false);

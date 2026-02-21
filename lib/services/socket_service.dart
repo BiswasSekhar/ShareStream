@@ -272,18 +272,25 @@ class SocketService {
 
     // Chat Events - with deduplication
     _socket!.on('chat-message', (data) {
-      final msgId = data['id'] ?? '';
+      final msgId = data['id'] as String? ?? '';
       final senderId = data['senderId'] ?? '';
       
-      // Check for duplicate message
-      final isDuplicate = messages.value.any((m) => m.id == msgId);
-      if (isDuplicate) {
-        debugPrint('[socket] Duplicate chat message ignored: $msgId');
-        return;
+      // Only deduplicate if message has a real ID (non-empty)
+      if (msgId.isNotEmpty) {
+        final isDuplicate = messages.value.any((m) => m.id == msgId);
+        if (isDuplicate) {
+          debugPrint('[socket] Duplicate chat message ignored: $msgId');
+          return;
+        }
       }
       
+      // Generate a unique ID if server didn't provide one
+      final effectiveId = msgId.isNotEmpty 
+          ? msgId 
+          : '${senderId}_${DateTime.now().millisecondsSinceEpoch}';
+      
       final msg = ChatMessage(
-        id: msgId,
+        id: effectiveId,
         senderId: senderId,
         senderName: data['sender'] ?? 'Unknown',
         senderRole: data['senderRole'] ?? 'viewer',

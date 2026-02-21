@@ -601,11 +601,19 @@ func handleBroadcastToRooms(s *socket.Socket, event string, data map[string]inte
 
 // handleTargetedEmit sends an event to a specific target socket by ID.
 func handleTargetedEmit(s *socket.Socket, event string, data map[string]interface{}) {
-	log.Printf("%s: %+v", event, data)
-	targetID, ok := data["targetId"].(string)
+	log.Printf("[targeted] %s from %s: %+v", event, s.Id(), data)
+	targetID, ok := data["to"].(string)
 	if !ok {
-		return
+		// Also try "targetId" for backwards compat
+		targetID, ok = data["targetId"].(string)
+		if !ok {
+			log.Printf("[targeted] Warning: no 'to' or 'targetId' field in %s event", event)
+			return
+		}
 	}
+	// Add sender's socket ID so receiver knows who sent it
+	data["from"] = string(s.Id())
+	log.Printf("[targeted] Forwarding %s to %s", event, targetID)
 	io_.To(socket.Room(targetID)).Emit(event, data)
 }
 
@@ -887,7 +895,7 @@ func findOrDownloadCloudflared() (string, error) {
 
 	// Determine OS-specific paths and download URL
 	var binaryName, downloadURL, downloadDir string
-	
+
 	switch runtime.GOOS {
 	case "darwin":
 		binaryName = "cloudflared"
