@@ -9,6 +9,7 @@ class SocketService {
   String? _currentRoom;
   String? _userId;
   String? _participantId;
+  String _userName = 'User';
   bool _isHost = false;
 
   final ValueNotifier<bool> connected = ValueNotifier(false);
@@ -126,14 +127,28 @@ class SocketService {
     });
 
     _socket!.on('participant-joined', (data) {
-      debugPrint('[socket] Participant joined: ${data['name']}');
+      final id = data['id'] as String? ?? '';
+      final name = data['name'] as String? ?? 'Unknown';
+      debugPrint('[socket] Participant joined: $name ($id)');
+      if (id.isNotEmpty) {
+        final current = List<Participant>.from(participants.value);
+        if (!current.any((p) => p.id == id)) {
+          current.add(Participant(id: id, name: name, role: 'viewer'));
+          participants.value = current;
+          debugPrint('[socket] Participants list updated: ${current.length} total');
+        }
+      }
     });
 
     _socket!.on('participant-left', (data) {
-      debugPrint('[socket] Participant left: ${data['id']}');
       final leftId = data['id'] as String?;
+      debugPrint('[socket] Participant left: $leftId');
       if (leftId != null) {
         onPeerLeft?.call(leftId);
+        final current = List<Participant>.from(participants.value);
+        current.removeWhere((p) => p.id == leftId);
+        participants.value = current;
+        debugPrint('[socket] Participants list updated: ${current.length} total');
       }
     });
 
@@ -329,6 +344,10 @@ class SocketService {
       if (data != null && data['success'] == true) {
         _currentRoom = data['room']?['code'];
         _isHost = true;
+        // Add self as first participant (host)
+        participants.value = [
+          Participant(id: _participantId ?? 'host', name: _userName, role: 'host'),
+        ];
         debugPrint('[socket] Created room: $_currentRoom');
       } else {
         debugPrint('[socket] Create room failed: $data');
@@ -341,6 +360,12 @@ class SocketService {
         _currentRoom = data['room']?['code'];
         final role = data['room']?['role'] ?? 'viewer';
         _isHost = role == 'host';
+        // Add self to participant list
+        final current = List<Participant>.from(participants.value);
+        if (!current.any((p) => p.id == _participantId)) {
+          current.add(Participant(id: _participantId ?? 'viewer', name: _userName, role: role));
+          participants.value = current;
+        }
         debugPrint('[socket] Joined room: $_currentRoom as $role');
       } else {
         debugPrint('[socket] Join failed: ${data?['error']}');
@@ -356,6 +381,7 @@ class SocketService {
   // Room Actions
   void createRoom({String? name, String? requestedCode}) {
     _isHost = true;
+    _userName = name ?? 'Host';
     _participantId = _generateParticipantId();
     _socket?.emit('create-room', {
       'participantId': _participantId,
@@ -367,6 +393,7 @@ class SocketService {
 
   void joinRoom(String code, {String? name}) {
     _isHost = false;
+    _userName = name ?? 'Guest';
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
     debugPrint('[socket] Emitting join-room for code: $normalizedCode, participant: $_participantId');
@@ -381,6 +408,7 @@ class SocketService {
   }
 
   void joinRequest(String code, String name) {
+    _userName = name;
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
     debugPrint('[socket] Sending join-request for code: $normalizedCode, participant: $_participantId');
