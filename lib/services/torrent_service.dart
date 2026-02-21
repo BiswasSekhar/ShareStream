@@ -263,7 +263,7 @@ class TorrentService {
       // Port 0 = auto-assign; the engine reports the actual port in events
       _process = await Process.start(
         enginePath,
-        ['-http', ':0'],
+        ['-http', ':0', '-port', '0'],
         runInShell: true,
       );
 

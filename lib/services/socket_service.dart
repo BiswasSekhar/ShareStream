@@ -396,15 +396,17 @@ class SocketService {
   void approveJoin(String participantId) {
     _socket?.emit('join-approve', {
       'participantId': participantId,
+      'code': _currentRoom,
     });
-    debugPrint('[socket] Approved join for: $participantId');
+    debugPrint('[socket] Approved join for: $participantId in room: $_currentRoom');
   }
 
   void rejectJoin(String participantId) {
     _socket?.emit('join-reject', {
       'participantId': participantId,
+      'code': _currentRoom,
     });
-    debugPrint('[socket] Rejected join for: $participantId');
+    debugPrint('[socket] Rejected join for: $participantId in room: $_currentRoom');
   }
 
   void requestJoinApproval() {
