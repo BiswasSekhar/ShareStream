@@ -94,11 +94,11 @@ class WebRTCService {
       _socket.emit('ready-for-connection', {});
 
       // Process any queued start-webrtc events from peers who started before us
+      // Create as NON-initiator: we wait for their offer (they're already in call)
       for (final pending in _pendingPeers) {
         final peerId = pending['peerId'] as String;
-        final initiator = pending['initiator'] as bool;
-        debugPrint('[webrtc] Processing pending peer: $peerId');
-        _createPeerConnection(peerId, initiator: initiator);
+        debugPrint('[webrtc] Processing pending peer: $peerId (as responder)');
+        await _createPeerConnection(peerId, initiator: false);
       }
       _pendingPeers.clear();
 
@@ -219,39 +219,30 @@ class WebRTCService {
   Future<void> handleOffer(String fromId, Map<String, dynamic> offerMap) async {
     if (!isInCall.value) return;
 
-    if (_peers.containsKey(fromId)) {
-      // Glare: we already created a peer as initiator, but the other side also sent an offer.
-      // Use socket ID comparison to decide who "wins" as initiator.
-      // The peer with the SMALLER socket ID becomes the responder (closes their offer).
-      final myId = _socket.userId ?? '';
-      if (myId.compareTo(fromId) < 0) {
-        // We have smaller ID → we become responder: tear down our initiator connection
-        debugPrint('[webrtc] Glare detected with $fromId — we become responder (our ID < their ID)');
-        final oldPc = _peers.remove(fromId);
-        await oldPc?.close();
-      } else {
-        // We have larger ID → we keep our initiator connection, ignore their offer
-        debugPrint('[webrtc] Glare detected with $fromId — we keep initiator role (our ID > their ID)');
-        return;
+    try {
+      if (!_peers.containsKey(fromId)) {
+        // No existing peer — create one as responder
+        await _createPeerConnection(fromId, initiator: false);
       }
+      // If peer already exists (from pending queue as non-initiator), just use it
+
+      final pc = _peers[fromId];
+      if (pc == null) return;
+
+      final offer = webrtc.RTCSessionDescription(offerMap['sdp'], offerMap['type']);
+      await pc.setRemoteDescription(offer);
+
+      final answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      _socket.emit('answer', {
+        'answer': answer.toMap(),
+        'to': fromId,
+      });
+      debugPrint('[webrtc] sent answer to $fromId');
+    } catch (e) {
+      debugPrint('[webrtc] handleOffer error: $e');
     }
-
-    await _createPeerConnection(fromId, initiator: false);
-
-    final pc = _peers[fromId];
-    if (pc == null) return;
-
-    final offer = webrtc.RTCSessionDescription(offerMap['sdp'], offerMap['type']);
-    await pc.setRemoteDescription(offer);
-
-    final answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-
-    _socket.emit('answer', {
-      'answer': answer.toMap(),
-      'to': fromId,
-    });
-    debugPrint('[webrtc] sent answer to $fromId');
   }
 
   Future<void> handleAnswer(String fromId, Map<String, dynamic> answerMap) async {
