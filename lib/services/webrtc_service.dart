@@ -219,9 +219,24 @@ class WebRTCService {
   Future<void> handleOffer(String fromId, Map<String, dynamic> offerMap) async {
     if (!isInCall.value) return;
 
-    if (!_peers.containsKey(fromId)) {
-      await _createPeerConnection(fromId, initiator: false);
+    if (_peers.containsKey(fromId)) {
+      // Glare: we already created a peer as initiator, but the other side also sent an offer.
+      // Use socket ID comparison to decide who "wins" as initiator.
+      // The peer with the SMALLER socket ID becomes the responder (closes their offer).
+      final myId = _socket.userId ?? '';
+      if (myId.compareTo(fromId) < 0) {
+        // We have smaller ID → we become responder: tear down our initiator connection
+        debugPrint('[webrtc] Glare detected with $fromId — we become responder (our ID < their ID)');
+        final oldPc = _peers.remove(fromId);
+        await oldPc?.close();
+      } else {
+        // We have larger ID → we keep our initiator connection, ignore their offer
+        debugPrint('[webrtc] Glare detected with $fromId — we keep initiator role (our ID > their ID)');
+        return;
+      }
     }
+
+    await _createPeerConnection(fromId, initiator: false);
 
     final pc = _peers[fromId];
     if (pc == null) return;
