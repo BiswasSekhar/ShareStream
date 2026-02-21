@@ -58,7 +58,7 @@ else
   FLUTTER_DEVICE="macos"
 fi
 
-# Check if Go server needs building
+# Check if Go signal server needs building
 GO_DIR="go/sharestream-signal"
 GO_SOURCE="$GO_DIR/cmd/main.go"
 GO_OUTPUT="$GO_DIR/$GO_BINARY"
@@ -76,9 +76,32 @@ if [ "$BUILD_GO" = true ] || [ ! -f "$GO_OUTPUT" ] || [ "$GO_SOURCE" -nt "$GO_OU
   go build -o "$GO_BINARY" ./cmd/main.go
   cd ../..
   
-  echo -e "${GREEN}✓ Go server built${NC}"
+  echo -e "${GREEN}✓ Go signal server built${NC}"
 else
-  echo -e "${GREEN}✓ Go server is up to date${NC}"
+  echo -e "${GREEN}✓ Go signal server is up to date${NC}"
+fi
+
+# Check if Go engine needs building
+ENGINE_DIR="go/sharestream-engine"
+ENGINE_SOURCE="$ENGINE_DIR/cmd/main.go"
+if [ "$OS" = "windows" ]; then
+  ENGINE_BINARY="sharestream-engine.exe"
+else
+  ENGINE_BINARY="sharestream-engine"
+fi
+ENGINE_OUTPUT="$ENGINE_DIR/$ENGINE_BINARY"
+
+if [ "$BUILD_GO" = true ] || [ ! -f "$ENGINE_OUTPUT" ] || [ "$ENGINE_SOURCE" -nt "$ENGINE_OUTPUT" ]; then
+  echo -e "${BLUE}Building Go torrent engine...${NC}"
+  
+  cd "$ENGINE_DIR"
+  go mod tidy
+  go build -o "$ENGINE_BINARY" ./cmd/main.go
+  cd ../..
+  
+  echo -e "${GREEN}✓ Go torrent engine built${NC}"
+else
+  echo -e "${GREEN}✓ Go torrent engine is up to date${NC}"
 fi
 
 # Check Flutter
