@@ -409,9 +409,10 @@ class WebRTCService {
       final makingOffer = _makingOffer[fromId] ?? false;
       
       // Check for offer collision (glare)
+      // Treat null signaling state as stable (freshly created peer)
       final signalingState = pc.signalingState;
-      final offerCollision = makingOffer || 
-          signalingState != webrtc.RTCSignalingState.RTCSignalingStateStable;
+      final isStable = signalingState == null || signalingState == webrtc.RTCSignalingState.RTCSignalingStateStable;
+      final offerCollision = makingOffer || !isStable;
 
       if (offerCollision) {
         if (!polite) {
