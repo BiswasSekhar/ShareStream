@@ -171,8 +171,18 @@ class WebRTCService {
     final pc = await webrtc.createPeerConnection(config);
 
     if (_localStream != null) {
-      for (final track in _localStream!.getTracks()) {
-        await pc.addTrack(track, _localStream!);
+      try {
+        for (final track in _localStream!.getTracks()) {
+          await pc.addTrack(track, _localStream!);
+        }
+      } catch (e) {
+        debugPrint('[webrtc] Warning: addTrack failed (will try addStream): $e');
+        // Fallback: try the older addStream API
+        try {
+          await pc.addStream(_localStream!);
+        } catch (e2) {
+          debugPrint('[webrtc] Warning: addStream also failed: $e2');
+        }
       }
     }
 

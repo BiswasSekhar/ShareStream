@@ -199,6 +199,19 @@ class TorrentService {
       '${File(Platform.resolvedExecutable).parent.path}/sharestream-signal',
     ];
 
+    // Add home-directory based path (macOS sandbox workaround)
+    final home = Platform.environment['HOME'] ?? '';
+    if (home.isNotEmpty) {
+      // macOS sandbox remaps HOME to container path, extract real home
+      String realHome = home;
+      final containerIdx = home.indexOf('/Library/Containers/');
+      if (containerIdx > 0) {
+        realHome = home.substring(0, containerIdx);
+      }
+      candidates.add('$realHome/ShareStream/go/sharestream-signal/sharestream-signal');
+      candidates.add('$home/ShareStream/go/sharestream-signal/sharestream-signal');
+    }
+
     final exeExt = Platform.isWindows ? '.exe' : '';
     candidates.add('C:/Users/biswa/ShareStream/go/sharestream-signal/bin/sharestream-signal$exeExt');
     candidates.add('sharestream-signal$exeExt');
@@ -218,7 +231,8 @@ class TorrentService {
     }
 
     try {
-      final result = await Process.run('where', ['sharestream-signal$exeExt']);
+      final cmd = Platform.isWindows ? 'where' : 'which';
+      final result = await Process.run(cmd, ['sharestream-signal$exeExt']);
       if (result.exitCode == 0) {
         final foundPath = (result.stdout as String).trim().split('\n').first;
         _log('[signal] Found signal in PATH: $foundPath');
@@ -541,6 +555,19 @@ class TorrentService {
       '${File(Platform.resolvedExecutable).parent.path}/sharestream-engine',
     ];
 
+    // Add home-directory based path (macOS sandbox workaround)
+    final home = Platform.environment['HOME'] ?? '';
+    if (home.isNotEmpty) {
+      // macOS sandbox remaps HOME to container path, extract real home
+      String realHome = home;
+      final containerIdx = home.indexOf('/Library/Containers/');
+      if (containerIdx > 0) {
+        realHome = home.substring(0, containerIdx);
+      }
+      candidates.add('$realHome/ShareStream/go/sharestream-engine/sharestream-engine');
+      candidates.add('$home/ShareStream/go/sharestream-engine/sharestream-engine');
+    }
+
     final exeExt = Platform.isWindows ? '.exe' : '';
     final debugPath = 'C:/Users/biswa/ShareStream/go/sharestream-engine/cmd/sharestream-engine$exeExt';
     
@@ -564,7 +591,8 @@ class TorrentService {
 
     // Try looking in PATH
     try {
-      final result = await Process.run('where', ['sharestream-engine$exeExt']);
+      final cmd = Platform.isWindows ? 'where' : 'which';
+      final result = await Process.run(cmd, ['sharestream-engine$exeExt']);
       if (result.exitCode == 0) {
         final foundPath = (result.stdout as String).trim().split('\n').first;
         _log('[torrent] Found engine in PATH: $foundPath');
