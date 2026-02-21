@@ -546,13 +546,14 @@ class TorrentService {
   }
 
   Future<String?> _findEnginePath() async {
+    // Extensionless first (macOS/Linux), then .exe (Windows)
     final candidates = [
-      'C:/Users/biswa/ShareStream/go/sharestream-engine/sharestream-engine.exe',
       'C:/Users/biswa/ShareStream/go/sharestream-engine/sharestream-engine',
-      '${Directory.current.path}/go/sharestream-engine/sharestream-engine.exe',
+      'C:/Users/biswa/ShareStream/go/sharestream-engine/sharestream-engine.exe',
       '${Directory.current.path}/go/sharestream-engine/sharestream-engine',
-      '${File(Platform.resolvedExecutable).parent.path}/sharestream-engine.exe',
+      '${Directory.current.path}/go/sharestream-engine/sharestream-engine.exe',
       '${File(Platform.resolvedExecutable).parent.path}/sharestream-engine',
+      '${File(Platform.resolvedExecutable).parent.path}/sharestream-engine.exe',
     ];
 
     // Add home-directory based path (macOS sandbox workaround)

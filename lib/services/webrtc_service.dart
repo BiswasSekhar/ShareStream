@@ -357,9 +357,9 @@ class WebRTCService {
       return;
     }
     
-    // Check signaling state
+    // Check signaling state — treat null as stable (freshly created peer)
     final signalingState = pc.signalingState;
-    if (signalingState != webrtc.RTCSignalingState.RTCSignalingStateStable) {
+    if (signalingState != null && signalingState != webrtc.RTCSignalingState.RTCSignalingStateStable) {
       debugPrint('[webrtc] Signaling state not stable ($signalingState), deferring negotiation');
       return;
     }

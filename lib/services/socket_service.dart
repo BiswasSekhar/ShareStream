@@ -163,9 +163,14 @@ class SocketService {
           debugPrint('[socket] Participants list updated: ${current.length} total');
         }
         
-        // Trigger WebRTC connection to new peer
-        // We are the initiator if our ID is lexicographically smaller
+        // Don't trigger WebRTC connection to ourselves
         final myId = _participantId ?? _userId ?? '';
+        if (id == myId || id == _userId) {
+          debugPrint('[socket] Skipping WebRTC trigger for self ($id)');
+          return;
+        }
+        
+        // Trigger WebRTC connection to new peer
         final imInitiator = myId.compareTo(id) < 0;
         debugPrint('[socket] Triggering WebRTC with $id, initiator: $imInitiator');
         onStartWebRTC?.call(id, imInitiator);
