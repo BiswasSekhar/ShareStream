@@ -555,6 +555,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   Widget _buildSettingsPanel() {
+    // Display tunnel URL if available (for sharing with viewers)
+    final displayUrl = _tunnelUrl ?? _serverController.text;
+    
     return GlassCard(
       padding: const EdgeInsets.all(AppTheme.spacingMD),
       child: Column(
@@ -563,7 +566,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           Row(
             children: [
               Text(
-                'Server URL',
+                _tunnelUrl != null ? 'Share URL (for viewers)' : 'Server URL',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: AppTheme.textSecondary,
                       fontWeight: FontWeight.w600,
@@ -583,10 +586,21 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           ),
           const SizedBox(height: 8),
           GlassTextField(
-            controller: _serverController,
+            controller: TextEditingController(text: displayUrl),
             hintText: _isDetecting ? 'Detecting server...' : 'Server URL',
             prefixIcon: Icons.dns_outlined,
+            onSubmitted: (_) {}, // Read-only when tunnel is active
           ),
+          if (_tunnelUrl != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Host connects via: localhost:3001',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: AppTheme.textMuted,
+                    fontSize: 11,
+                  ),
+            ),
+          ],
         ],
       ),
     ).animate().fadeIn().slideY(begin: -0.1);

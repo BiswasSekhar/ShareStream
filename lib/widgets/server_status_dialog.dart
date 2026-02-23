@@ -166,7 +166,16 @@ class _ServerStatusDialogState extends State<ServerStatusDialog> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _buildDetailRow('Server URL', torrent.serverUrl.value ?? 'Not running'),
+                        Consumer<RoomProvider>(
+                          builder: (context, provider, _) {
+                            final shareUrl = provider.shareUrl;
+                            final isTunnel = shareUrl != provider.serverUrl;
+                            return _buildDetailRow(
+                              isTunnel ? 'Share URL (for viewers)' : 'Server URL',
+                              shareUrl ?? 'Not configured',
+                            );
+                          },
+                        ),
                         const SizedBox(height: 8),
                         _buildDetailRow('Magnet URI', torrent.magnetUri.value ?? 'None'),
                         const SizedBox(height: 8),
