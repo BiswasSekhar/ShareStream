@@ -31,7 +31,8 @@ class TopBarWidget extends StatelessWidget {
 
   void _copyRoomCode(BuildContext context) {
     final code = provider.roomCode;
-    final url = provider.serverUrl;
+    // Use shareUrl (tunnel URL for host) so external viewers can connect
+    final url = provider.shareUrl;
     if (code != null) {
       final copyText = url != null ? '$url#$code' : code;
       Clipboard.setData(ClipboardData(text: copyText));

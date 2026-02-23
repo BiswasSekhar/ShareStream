@@ -25,6 +25,9 @@ class RoomProvider extends ChangeNotifier {
   bool _isProcessing = false;
   String _serverUrl = dotenv.env['SERVER_URL'] ?? 'http://localhost:3001';
   
+  // Tunnel URL for sharing (external viewers use this)
+  String? _tunnelUrl;
+  
   // Join approval state
   bool _joinPending = false;
   bool _joinApproved = false;
@@ -68,6 +71,9 @@ class RoomProvider extends ChangeNotifier {
   double get downloadProgress => _downloadProgress;
   bool get isProcessing => _isProcessing;
   String get serverUrl => _serverUrl;
+  
+  /// URL for sharing with viewers (tunnel URL if available)
+  String? get shareUrl => _tunnelUrl ?? _serverUrl;
 
   ValueNotifier<List<Participant>> get participants => _socket.participants;
   ValueNotifier<List<ChatMessage>> get messages => _socket.messages;
@@ -78,8 +84,12 @@ class RoomProvider extends ChangeNotifier {
   bool get joinApproved => _joinApproved;
   bool get joinRejected => _joinRejected;
 
-  void setServerUrl(String url) {
+  void setServerUrl(String url, {String? tunnelUrl}) {
+    debugPrint('[provider] setServerUrl called:');
+    debugPrint('[provider]   _serverUrl = $url');
+    debugPrint('[provider]   _tunnelUrl = $tunnelUrl');
     _serverUrl = url;
+    _tunnelUrl = tunnelUrl;
     notifyListeners();
   }
 

@@ -31,6 +31,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   bool _showSettings = false;
   bool _isDetecting = false;
   bool _serverReady = false;
+  
+  // Store tunnel URL for sharing with viewers (host uses localhost)
+  String? _tunnelUrl;
 
   @override
   void initState() {
@@ -65,11 +68,18 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       final torrent = TorrentService();
       await torrent.checkAndStartSignalServer();
 
-      final tunnelUrl = TorrentService.tunnelUrl;
-      if (tunnelUrl != null) {
-        _serverController.text = tunnelUrl;
-        _serverReady = true;
-        debugPrint('[home] Using tunnel URL: $tunnelUrl');
+      // Check for tunnel URL from the service
+      _tunnelUrl = TorrentService.tunnelUrl;
+      if (_tunnelUrl != null) {
+        debugPrint('[home] ==========================================');
+        debugPrint('[home] Tunnel URL available for sharing: $_tunnelUrl');
+        debugPrint('[home] HOST will use: http://localhost:3001');
+        debugPrint('[home] ==========================================');
+        // HOST always uses localhost, tunnel is only for viewers
+        setState(() {
+          _serverController.text = 'http://localhost:3001';
+          _serverReady = true;
+        });
         return;
       }
 
@@ -81,15 +91,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           ).timeout(const Duration(seconds: 3));
           if (response.statusCode == 200) {
             final data = jsonDecode(response.body);
-            // Server is live — use tunnel URL if available, else localhost
-            final tunnel = data['tunnel'] as String?;
-            if (tunnel != null && tunnel.isNotEmpty) {
-              _serverController.text = tunnel;
-              debugPrint('[home] Auto-detected tunnel URL on port $port: $tunnel');
-            } else {
-              _serverController.text = 'http://localhost:$port';
-              debugPrint('[home] No tunnel — using localhost:$port directly');
+            // Store tunnel for sharing but use localhost for host connection
+            _tunnelUrl = data['tunnel'] as String?;
+            if (_tunnelUrl != null && _tunnelUrl!.isNotEmpty) {
+              debugPrint('[home] Tunnel URL available for sharing: $_tunnelUrl');
             }
+            // HOST always uses localhost
+            _serverController.text = 'http://localhost:$port';
+            debugPrint('[home] Host using localhost:$port for connection');
             _serverReady = true;
             return;
           }
@@ -148,7 +157,16 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     setState(() => _isCreating = true);
 
     final provider = context.read<RoomProvider>();
-    provider.setServerUrl(_serverController.text.trim());
+    final serverUrl = _serverController.text.trim();
+    
+    debugPrint('[home] ==========================================');
+    debugPrint('[home] Creating room with:');
+    debugPrint('[home]   Server URL (for host): $serverUrl');
+    debugPrint('[home]   Tunnel URL (for sharing): $_tunnelUrl');
+    debugPrint('[home] ==========================================');
+    
+    // Pass tunnel URL for sharing (host uses localhost, viewers use tunnel)
+    provider.setServerUrl(serverUrl, tunnelUrl: _tunnelUrl);
     provider.setUserName(_nameController.text.trim());
 
     final code = await provider.createRoom();
