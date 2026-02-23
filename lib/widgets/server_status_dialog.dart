@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 
 import '../providers/room_provider.dart';
 import '../theme/app_theme.dart';
+import '../utils/app_logger.dart';
 
 class ServerStatusDialog extends StatefulWidget {
   const ServerStatusDialog({super.key});
@@ -16,7 +17,9 @@ class ServerStatusDialog extends StatefulWidget {
 }
 
 class _ServerStatusDialogState extends State<ServerStatusDialog> {
-  String _logs = 'Loading logs...';
+  String _torrentLogs = 'Loading torrent logs...';
+  String _appLogs = 'Loading app logs...';
+  bool _showAppLogs = true;
   Timer? _refreshTimer;
   final ScrollController _scrollController = ScrollController();
 
@@ -33,24 +36,38 @@ class _ServerStatusDialogState extends State<ServerStatusDialog> {
     _scrollController.dispose();
     super.dispose();
   }
-
   Future<void> _loadLogs() async {
+    // Load App Logs
+    final appLogs = await AppLogger.getLogs();
+    if (mounted) setState(() => _appLogs = appLogs);
+
+    // Load Torrent Logs
     try {
       final dir = await getApplicationSupportDirectory();
       final file = File('${dir.path}/torrent.log');
       if (await file.exists()) {
         final lines = await file.readAsLines();
-        // Take last 50 lines
         final recent = lines.length > 50 ? lines.sublist(lines.length - 50) : lines;
-        if (mounted) {
-          setState(() => _logs = recent.join('\n'));
-        }
+        if (mounted) setState(() => _torrentLogs = recent.join('\\n'));
       } else {
-        if (mounted) setState(() => _logs = 'No log file found at ${file.path}');
+        if (mounted) setState(() => _torrentLogs = 'No log file found at ${file.path}');
       }
     } catch (e) {
-      if (mounted) setState(() => _logs = 'Failed to read logs: $e');
+      if (mounted) setState(() => _torrentLogs = 'Failed to read torrent logs: $e');
     }
+  }
+
+  Future<void> _clearLogs() async {
+    if (_showAppLogs) {
+      await AppLogger.clearLogs();
+    } else {
+      try {
+        final dir = await getApplicationSupportDirectory();
+        final file = File('${dir.path}/torrent.log');
+        if (await file.exists()) await file.writeAsString('');
+      } catch (_) {}
+    }
+    await _loadLogs();
   }
 
   @override
@@ -72,7 +89,7 @@ class _ServerStatusDialogState extends State<ServerStatusDialog> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 const Text(
-                  'Server Status',
+                  'Diagnostics & Logs',
                   style: TextStyle(
                     color: AppTheme.textPrimary,
                     fontSize: 20,
@@ -162,15 +179,24 @@ class _ServerStatusDialogState extends State<ServerStatusDialog> {
             ),
 
             const SizedBox(height: 24),
-            const Text(
-              'Logs',
-              style: TextStyle(
-                color: AppTheme.textPrimary,
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-              ),
+            Row(
+              children: [
+                _buildTab('App Events & Errors', _showAppLogs, () => setState(() => _showAppLogs = true)),
+                const SizedBox(width: 8),
+                _buildTab('Torrent Engine', !_showAppLogs, () => setState(() => _showAppLogs = false)),
+                const Spacer(),
+                TextButton.icon(
+                  onPressed: _clearLogs,
+                  icon: const Icon(Icons.delete_outline, size: 16, color: AppTheme.error),
+                  label: const Text('Clear Active Log', style: TextStyle(color: AppTheme.error)),
+                  style: TextButton.styleFrom(
+                    backgroundColor: AppTheme.error.withValues(alpha: 0.1),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             Expanded(
               child: Container(
                 width: double.infinity,
@@ -182,9 +208,9 @@ class _ServerStatusDialogState extends State<ServerStatusDialog> {
                 ),
                 child: SingleChildScrollView(
                   controller: _scrollController,
-                  reverse: true, // Auto-scroll to bottom behavior
+                  reverse: true,
                   child: Text(
-                    _logs,
+                    _showAppLogs ? _appLogs : _torrentLogs,
                     style: const TextStyle(
                       color: Color(0xFF00FF00),
                       fontFamily: 'Consolas',
@@ -195,6 +221,30 @@ class _ServerStatusDialogState extends State<ServerStatusDialog> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTab(String label, bool isSelected, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        decoration: BoxDecoration(
+          color: isSelected ? AppTheme.primary.withValues(alpha: 0.2) : AppTheme.bgElevated,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: isSelected ? AppTheme.primary : AppTheme.border.withValues(alpha: 0.3),
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: isSelected ? AppTheme.primary : AppTheme.textSecondary,
+            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+          ),
         ),
       ),
     );

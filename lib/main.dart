@@ -8,8 +8,11 @@ import 'screens/home_screen.dart';
 import 'screens/developer_screen.dart';
 import 'services/log_service.dart';
 
+import 'utils/app_logger.dart';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AppLogger.init();
   await dotenv.load(fileName: '.env');
   MediaKit.ensureInitialized();
   

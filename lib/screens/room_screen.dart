@@ -46,10 +46,15 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
 
     _player = Player(
       configuration: const PlayerConfiguration(
-        bufferSize: 32 * 1024 * 1024,
+        title: 'ShareStream',
       ),
     );
-    _videoController = VideoController(_player);
+    _videoController = VideoController(
+      _player,
+      configuration: const VideoControllerConfiguration(
+        enableHardwareAcceleration: false,
+      ),
+    );
 
     // Listen to player state
     _player.stream.playing.listen((playing) {

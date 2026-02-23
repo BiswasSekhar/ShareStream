@@ -32,7 +32,7 @@ var (
 	io_       *socket.Server
 	tunnelURL string
 	tunnelMu  sync.RWMutex
-	
+
 	// Socket to participant ID mapping for WebRTC signaling
 	socketToParticipant = make(map[string]string)
 	participantToSocket = make(map[string]string)
@@ -124,14 +124,14 @@ func main() {
 				reason = fmt.Sprintf("%v", args[0])
 			}
 			log.Printf("Client disconnected: %s (reason: %s)", client.Id(), reason)
-			
+
 			// Clean up participant mapping
 			participantMu.Lock()
 			participantID := socketToParticipant[string(client.Id())]
 			delete(socketToParticipant, string(client.Id()))
 			delete(participantToSocket, participantID)
 			participantMu.Unlock()
-			
+
 			if participantID != "" {
 				log.Printf("[JOIN] Cleaned up mapping for participant %s", participantID)
 			}
@@ -211,13 +211,13 @@ func registerEventHandlers(client *socket.Socket) {
 		participantID, ok := data["participantId"].(string)
 		if ok && participantID != "" {
 			client.Join(socket.Room(participantID))
-			
+
 			// Store the mapping
 			participantMu.Lock()
 			socketToParticipant[string(client.Id())] = participantID
 			participantToSocket[participantID] = string(client.Id())
 			participantMu.Unlock()
-			
+
 			log.Printf("[JOIN] Client %s registered as participant %s", client.Id(), participantID)
 		}
 	})
@@ -270,36 +270,36 @@ func registerEventHandlers(client *socket.Socket) {
 		participantMu.RLock()
 		myParticipantID := socketToParticipant[string(client.Id())]
 		participantMu.RUnlock()
-		
+
 		if myParticipantID == "" {
 			log.Printf("[webrtc] Warning: client %s not registered, using socket ID", client.Id())
 			myParticipantID = string(client.Id())
 		}
-		
+
 		// When a client is ready, notify all other participants to start WebRTC
 		for _, room := range client.Rooms().Keys() {
 			// Skip the client's own socket room and participant room
 			if room == socket.Room(client.Id()) || room == socket.Room(myParticipantID) {
 				continue
 			}
-			
+
 			// Get the room to find participants
 			r := roomManager.GetRoom(string(room))
 			if r == nil {
 				continue
 			}
-			
+
 			// Notify each participant in the room
 			r.mu.RLock()
 			for participantID := range r.Approved {
 				if participantID == myParticipantID {
 					continue // Don't notify ourselves
 				}
-				
+
 				// Determine who is the initiator based on ID comparison
 				// The peer with lexicographically smaller ID initiates
 				isInitiator := myParticipantID < participantID
-				
+
 				// Send to the participant's room
 				io_.To(socket.Room(participantID)).Emit("start-webrtc", map[string]interface{}{
 					"peerId":    myParticipantID,
@@ -665,19 +665,19 @@ func handleTargetedEmit(s *socket.Socket, event string, data map[string]interfac
 			return
 		}
 	}
-	
+
 	// Get sender's participant ID for WebRTC signaling
 	participantMu.RLock()
 	senderParticipantID := socketToParticipant[string(s.Id())]
 	participantMu.RUnlock()
-	
+
 	// Use participant ID if available, otherwise fall back to socket ID
 	if senderParticipantID != "" {
 		data["from"] = senderParticipantID
 	} else {
 		data["from"] = string(s.Id())
 	}
-	
+
 	log.Printf("[targeted] Forwarding %s to %s (from: %s)", event, targetID, data["from"])
 	io_.To(socket.Room(targetID)).Emit(event, data)
 }
@@ -951,7 +951,21 @@ func startCloudflaredTunnel(port int) {
 }
 
 func findOrDownloadCloudflared() (string, error) {
-	// First check if cloudflared is in PATH
+	// First check if cloudflared is bundled in the same directory
+	exePath, err := os.Executable()
+	if err == nil {
+		exeDir := filepath.Dir(exePath)
+		bundledPath := filepath.Join(exeDir, "cloudflared.exe")
+		if runtime.GOOS != "windows" {
+			bundledPath = filepath.Join(exeDir, "cloudflared")
+		}
+		if _, err := os.Stat(bundledPath); err == nil {
+			log.Printf("Found bundled cloudflared: %s", bundledPath)
+			return bundledPath, nil
+		}
+	}
+
+	// Then check if cloudflared is in PATH
 	path, err := exec.LookPath("cloudflared")
 	if err == nil {
 		log.Printf("Found cloudflared in PATH: %s", path)
@@ -967,15 +981,15 @@ func findOrDownloadCloudflared() (string, error) {
 		homeDir := os.Getenv("HOME")
 		downloadDir = filepath.Join(homeDir, ".sharestream")
 		if runtime.GOARCH == "arm64" {
-			downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-darwin-arm64"
+			downloadURL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64"
 		} else {
-			downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-darwin-amd64"
+			downloadURL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64"
 		}
 	case "linux":
 		binaryName = "cloudflared"
 		homeDir := os.Getenv("HOME")
 		downloadDir = filepath.Join(homeDir, ".sharestream")
-		downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64"
+		downloadURL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 	case "windows":
 		binaryName = "cloudflared.exe"
 		appData := os.Getenv("APPDATA")
@@ -984,7 +998,7 @@ func findOrDownloadCloudflared() (string, error) {
 		} else {
 			downloadDir = "."
 		}
-		downloadURL = "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-windows-amd64.exe"
+		downloadURL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
 	default:
 		return "", fmt.Errorf("cloudflared not found in PATH and auto-download not supported for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
