@@ -54,7 +54,8 @@ Confirmation of room creation.
     "code": "ABC12345",
     "host": "flutter_1234567890",
     "role": "host",
-    "tunnel": "https://xxx.trycloudflare.com"
+    "tunnel": "https://xxx.trycloudflare.com",
+    "inviteToken": "<signed-token>"
   }
 }
 ```
@@ -115,7 +116,8 @@ Request to join a room (requires host approval).
 {
   "code": "ABC12345",
   "participantId": "flutter_1234567890",
-  "name": "Viewer Name"
+  "name": "Viewer Name",
+  "inviteToken": "<signed-token>"
 }
 ```
 
@@ -273,46 +275,62 @@ Notify about room mode changes.
 
 ## Playback Sync Events
 
-### sync-play
-**Direction**: Host → Server → Broadcast
+### control-request
+**Direction**: Any Participant → Server
 
-Host requests playback to start/resume.
+Participant requests playback control operation.
 
 **Payload**:
 ```json
 {
-  "time": 125.5,
-  "actionId": "1699999999999"
+  "code": "ABC12345",
+  "participantId": "flutter_1234567890",
+  "actionId": "flutter_123_1700000000000",
+  "actionType": "play|pause|seek",
+  "targetTimeSec": 125.5,
+  "playWhenReady": true,
+  "baseSeq": 12,
+  "sentAtMs": 1700000000000
 }
 ```
 
 ---
 
-### sync-pause
-**Direction**: Host → Server → Broadcast
+### control-committed
+**Direction**: Server → Room Broadcast
 
-Host requests playback to pause.
+Server-authoritative ordered playback event (strict last-write-wins by sequence).
 
 **Payload**:
 ```json
 {
-  "time": 125.5,
-  "actionId": "1699999999999"
+  "serverSeq": 13,
+  "actionId": "flutter_123_1700000000000",
+  "actionType": "play|pause|seek",
+  "targetTimeSec": 125.5,
+  "playWhenReady": true,
+  "initiatorParticipantId": "flutter_1234567890",
+  "serverCommitMs": 1700000000022
 }
 ```
 
 ---
 
-### sync-seek
-**Direction**: Host → Server → Broadcast
+### control-ack
+**Direction**: Participant → Server → Host
 
-Host requests seek to a specific time.
+Acknowledges client-applied control event for drift diagnostics.
 
 **Payload**:
 ```json
 {
-  "time": 300.0,
-  "actionId": "1699999999999"
+  "code": "ABC12345",
+  "serverSeq": 13,
+  "participantId": "flutter_1234567890",
+  "currentTimeSec": 125.7,
+  "playing": true,
+  "bufferedSec": 22.1,
+  "sentAtMs": 1700000000100
 }
 ```
 
@@ -326,7 +344,9 @@ Send current playback state to new joiners.
 **Payload**:
 ```json
 {
+  "serverSeq": 13,
   "playback": {
+    "serverSeq": 13,
     "time": 125.5,
     "type": "play|pause"
   }
@@ -639,9 +659,9 @@ Common error messages:
 | register-participant | C→S | Register for targeted messaging |
 | torrent-magnet | C↔S | Share magnet URI |
 | movie-loaded | C↔S | Movie ready notification |
-| sync-play | C→S | Play command |
-| sync-pause | C→S | Pause command |
-| sync-seek | C→S | Seek command |
+| control-request | C→S | Playback control request |
+| control-committed | S→C | Ordered control commit |
+| control-ack | C→S | Control apply acknowledgment |
 | playback-snapshot | S→C | Current playback state |
 | sync-check | C→S | Request position reports |
 | sync-report | C→S | Position report |

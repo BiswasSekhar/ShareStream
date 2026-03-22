@@ -87,7 +87,11 @@ func main() {
 						Peers:      info.Peers,
 						Name:       info.Name,
 					}
-					b, _ := json.Marshal(progress)
+					b, err := json.Marshal(progress)
+					if err != nil {
+						logger.Error("failed to marshal progress event", "error", err)
+						continue
+					}
 					writer.Write(append(b, '\n'))
 				}
 			}

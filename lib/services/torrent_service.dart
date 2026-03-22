@@ -6,15 +6,20 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
-const String signalServerBaseUrl = 'http://localhost:3001';
+final String signalServerBaseUrl =
+    dotenv.env['SIGNAL_BASE_URL'] ?? 'http://localhost:3001';
 
 class EngineLogService {
   static final List<String> _engineLogs = [];
   static final List<String> _signalLogs = [];
   static const int _maxLogs = 500;
+  static final ValueNotifier<int> _engineLogsVersion = ValueNotifier(0);
+  static final ValueNotifier<int> _signalLogsVersion = ValueNotifier(0);
 
   static List<String> get engineLogs => List.unmodifiable(_engineLogs);
   static List<String> get signalLogs => List.unmodifiable(_signalLogs);
+  static ValueListenable<int> get engineLogsVersion => _engineLogsVersion;
+  static ValueListenable<int> get signalLogsVersion => _signalLogsVersion;
 
   static void addEngineLog(String message) {
     final timestamp = DateTime.now().toIso8601String();
@@ -22,6 +27,7 @@ class EngineLogService {
     if (_engineLogs.length > _maxLogs) {
       _engineLogs.removeAt(0);
     }
+    _engineLogsVersion.value++;
   }
 
   static void addSignalLog(String message) {
@@ -30,10 +36,18 @@ class EngineLogService {
     if (_signalLogs.length > _maxLogs) {
       _signalLogs.removeAt(0);
     }
+    _signalLogsVersion.value++;
   }
 
-  static void clearEngineLogs() => _engineLogs.clear();
-  static void clearSignalLogs() => _signalLogs.clear();
+  static void clearEngineLogs() {
+    _engineLogs.clear();
+    _engineLogsVersion.value++;
+  }
+
+  static void clearSignalLogs() {
+    _signalLogs.clear();
+    _signalLogsVersion.value++;
+  }
 }
 
 /// Manages a Go-based sharestream-engine subprocess for P2P streaming.
@@ -46,6 +60,7 @@ class EngineLogService {
 class TorrentService {
   Process? _process;
   Process? _signalProcess;
+  bool _ownsSignalProcess = false;
   StreamSubscription? _stdoutSub;
   File? _logFile;
   Timer? _watchdogTimer;
@@ -53,7 +68,7 @@ class TorrentService {
   static const int _maxRestarts = 3;
 
   static String? _cachedTunnelUrl;
-  
+
   /// Whether we're on a mobile platform (no local engine).
   bool get isMobile => Platform.isAndroid || Platform.isIOS;
 
@@ -82,13 +97,19 @@ class TorrentService {
 
   Future<bool> checkAndStartSignalServer() async {
     try {
-      final response = await http.get(Uri.parse('$signalServerBaseUrl/health')).timeout(
-        const Duration(seconds: 2),
-      );
+      final response = await http
+          .get(Uri.parse('$signalServerBaseUrl/health'))
+          .timeout(const Duration(seconds: 2));
       if (response.statusCode == 200) {
         _log('[signal] Signal server already running on $signalServerBaseUrl');
-        // Try to get tunnel URL, but don't kill the server if it fails
-        await _fetchTunnelUrl();
+        final ok = await _fetchTunnelUrl();
+        if (!ok) {
+          _log(
+            '[signal] Existing signal has stale tunnel state — restarting signal server',
+          );
+          await _killExistingSignalServer();
+          return await _startSignalServer();
+        }
         return true;
       }
     } catch (e) {
@@ -101,7 +122,12 @@ class TorrentService {
   Future<void> _killExistingSignalServer() async {
     try {
       if (Platform.isWindows) {
-        await Process.run('taskkill', ['/F', '/IM', 'sharestream-signal.exe', '/T']);
+        await Process.run('taskkill', [
+          '/F',
+          '/IM',
+          'sharestream-signal.exe',
+          '/T',
+        ]);
       } else {
         await Process.run('pkill', ['-f', 'sharestream-signal']);
       }
@@ -121,28 +147,31 @@ class TorrentService {
       }
 
       _log('[signal] Starting signal server: $signalPath');
-      _signalProcess = await Process.start(
-        signalPath,
-        [],
-        runInShell: true,
-      );
+      _signalProcess = await Process.start(signalPath, [], runInShell: true);
+      _ownsSignalProcess = true;
 
-      _signalProcess!.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
-        _log('[signal-stdout] $line');
-        EngineLogService.addSignalLog('[signal-stdout] $line');
-      });
+      _signalProcess!.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+            _log('[signal-stdout] $line');
+            EngineLogService.addSignalLog('[signal-stdout] $line');
+          });
 
-      _signalProcess!.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
-        _log('[signal-stderr] $line');
-        EngineLogService.addSignalLog('[signal-stderr] $line');
-      });
+      _signalProcess!.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+            _log('[signal-stderr] $line');
+            EngineLogService.addSignalLog('[signal-stderr] $line');
+          });
 
       for (int i = 0; i < 10; i++) {
         await Future.delayed(const Duration(seconds: 1));
         try {
-          final response = await http.get(Uri.parse('$signalServerBaseUrl/health')).timeout(
-            const Duration(seconds: 2),
-          );
+          final response = await http
+              .get(Uri.parse('$signalServerBaseUrl/health'))
+              .timeout(const Duration(seconds: 2));
           if (response.statusCode == 200) {
             _log('[signal] Signal server started successfully');
             await _fetchTunnelUrl();
@@ -162,13 +191,14 @@ class TorrentService {
   }
 
   Future<bool> _fetchTunnelUrl() async {
+    bool sawReadyFalse = false;
     // Retry up to 3 times — the tunnel may take a while to become ready
     for (int attempt = 0; attempt < 3; attempt++) {
       await Future.delayed(const Duration(seconds: 3));
       try {
-        final response = await http.get(Uri.parse('$signalServerBaseUrl/api/tunnel')).timeout(
-          const Duration(seconds: 5),
-        );
+        final response = await http
+            .get(Uri.parse('$signalServerBaseUrl/api/tunnel'))
+            .timeout(const Duration(seconds: 5));
         if (response.statusCode == 200) {
           final data = jsonDecode(response.body);
           // Server returns key 'tunnel', with a 'ready' boolean
@@ -179,58 +209,55 @@ class TorrentService {
             _log('[signal] Got tunnel URL: $_cachedTunnelUrl');
             return true;
           }
+          if (!ready) {
+            sawReadyFalse = true;
+          }
           _log('[signal] Tunnel not ready yet (attempt ${attempt + 1}/3)');
         }
       } catch (e) {
-        _log('[signal] Could not fetch tunnel URL (attempt ${attempt + 1}/3): $e');
+        _log(
+          '[signal] Could not fetch tunnel URL (attempt ${attempt + 1}/3): $e',
+        );
       }
+    }
+
+    if (sawReadyFalse) {
+      _cachedTunnelUrl = null;
+      _log('[signal] Tunnel reported not ready; clearing cached tunnel URL');
     }
     _log('[signal] Tunnel URL unavailable after 3 attempts');
     return false;
   }
 
   Future<String?> _findSignalPath() async {
-    // Extensionless first (macOS/Linux), then .exe (Windows)
+    // Portable discovery: current dir, executable dir, PATH
+    final exeExt = Platform.isWindows ? '.exe' : '';
     final candidates = [
-      'C:/Users/biswa/ShareStream/go/sharestream-signal/sharestream-signal',
-      'C:/Users/biswa/ShareStream/go/sharestream-signal/sharestream-signal.exe',
-      '${Directory.current.path}/go/sharestream-signal/sharestream-signal',
-      '${Directory.current.path}/go/sharestream-signal/sharestream-signal.exe',
-      '${File(Platform.resolvedExecutable).parent.path}/sharestream-signal',
-      '${File(Platform.resolvedExecutable).parent.path}/sharestream-signal.exe',
+      '${Directory.current.path}/go/sharestream-signal/sharestream-signal$exeExt',
+      '${File(Platform.resolvedExecutable).parent.path}/sharestream-signal$exeExt',
     ];
 
     // Add home-directory based path (macOS sandbox workaround)
     final home = Platform.environment['HOME'] ?? '';
     if (home.isNotEmpty) {
-      // macOS sandbox remaps HOME to container path, extract real home
       String realHome = home;
       final containerIdx = home.indexOf('/Library/Containers/');
       if (containerIdx > 0) {
         realHome = home.substring(0, containerIdx);
       }
-      candidates.add('$realHome/ShareStream/go/sharestream-signal/sharestream-signal');
-      candidates.add('$home/ShareStream/go/sharestream-signal/sharestream-signal');
+      candidates.add(
+        '$realHome/ShareStream/go/sharestream-signal/sharestream-signal$exeExt',
+      );
     }
 
-    final exeExt = Platform.isWindows ? '.exe' : '';
-    candidates.add('C:/Users/biswa/ShareStream/go/sharestream-signal/bin/sharestream-signal$exeExt');
-    candidates.add('sharestream-signal$exeExt');
-    candidates.add('${File(Platform.resolvedExecutable).parent.path}/sharestream-signal$exeExt');
-
     for (final path in candidates) {
-      var fullPath = path.replaceAll('\$exeExt', exeExt);
-      fullPath = fullPath.replaceAll('\$\{Directory.current.path\}', Directory.current.path);
-      fullPath = fullPath.replaceAll('\$\{File(Platform.resolvedExecutable).parent.path\}', 
-          File(Platform.resolvedExecutable).parent.path);
-      fullPath = fullPath.replaceAll('\$debugPath', 'C:/Users/biswa/ShareStream/go/sharestream-signal/bin/sharestream-signal$exeExt');
-      
-      if (File(fullPath).existsSync()) {
-        _log('[signal] Found signal at: $fullPath');
-        return fullPath;
+      if (File(path).existsSync()) {
+        _log('[signal] Found signal at: $path');
+        return path;
       }
     }
 
+    // Try looking in PATH
     try {
       final cmd = Platform.isWindows ? 'where' : 'which';
       final result = await Process.run(cmd, ['sharestream-signal$exeExt']);
@@ -276,11 +303,12 @@ class TorrentService {
       _log('[torrent] Starting engine: $enginePath');
 
       // Port 0 = auto-assign; the engine reports the actual port in events
-      _process = await Process.start(
-        enginePath,
-        ['-http', ':0', '-port', '0'],
-        runInShell: true,
-      );
+      _process = await Process.start(enginePath, [
+        '-http',
+        ':0',
+        '-port',
+        '0',
+      ], runInShell: true);
 
       _stdoutSub = _process!.stdout
           .transform(utf8.decoder)
@@ -291,8 +319,8 @@ class TorrentService {
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
-        _log('[torrent-stderr] $line');
-      });
+            _log('[torrent-stderr] $line');
+          });
 
       _process!.exitCode.then((code) {
         _log('[torrent] Engine exited with code: $code');
@@ -302,7 +330,9 @@ class TorrentService {
         // Auto-restart on unexpected exit
         if (_restartCount < _maxRestarts) {
           _restartCount++;
-          _log('[torrent] Auto-restarting engine (attempt $_restartCount/$_maxRestarts)');
+          _log(
+            '[torrent] Auto-restarting engine (attempt $_restartCount/$_maxRestarts)',
+          );
           Future.delayed(const Duration(seconds: 2), () => start());
         } else {
           lastError.value = 'Engine crashed $_maxRestarts times, giving up';
@@ -335,11 +365,7 @@ class TorrentService {
     progress.value = 1.0;
     lastError.value = null;
 
-    _send({
-      'cmd': 'seed',
-      'filePath': filePath,
-      'trackerUrl': _trackerUrl,
-    });
+    _send({'cmd': 'seed', 'filePath': filePath, 'trackerUrl': _trackerUrl});
 
     return _seedCompleter!.future;
   }
@@ -356,11 +382,7 @@ class TorrentService {
     progress.value = 0;
     lastError.value = null;
 
-    _send({
-      'cmd': 'add',
-      'magnetURI': magnet,
-      'trackerUrl': _trackerUrl,
-    });
+    _send({'cmd': 'add', 'magnetURI': magnet, 'trackerUrl': _trackerUrl});
 
     return _addCompleter!.future;
   }
@@ -376,6 +398,12 @@ class TorrentService {
     torrentName.value = null;
   }
 
+  /// Add a peer address directly for faster P2P discovery (peer exchange).
+  void addPeer(String address) {
+    _send({'cmd': 'add-peer', 'peerAddress': address});
+    _log('[torrent] Sent add-peer command: $address');
+  }
+
   /// Shut down the engine process.
   Future<void> dispose() async {
     _stopWatchdog();
@@ -386,6 +414,26 @@ class TorrentService {
     await Future.delayed(const Duration(seconds: 2));
     _process?.kill();
     _process = null;
+
+    if (_ownsSignalProcess && _signalProcess != null) {
+      _log('[signal] Stopping owned signal server process');
+      try {
+        if (Platform.isWindows) {
+          await Process.run('taskkill', [
+            '/PID',
+            _signalProcess!.pid.toString(),
+            '/T',
+            '/F',
+          ]);
+        } else {
+          _signalProcess!.kill(ProcessSignal.sigterm);
+        }
+      } catch (e) {
+        _log('[signal] Failed to stop owned signal process: $e');
+      }
+    }
+    _signalProcess = null;
+    _ownsSignalProcess = false;
 
     isReady.dispose();
     isSeeding.dispose();
@@ -435,7 +483,10 @@ class TorrentService {
     if (_logFile != null) {
       try {
         final timestamp = DateTime.now().toIso8601String();
-        _logFile!.writeAsStringSync('[$timestamp] $message\n', mode: FileMode.append);
+        _logFile!.writeAsStringSync(
+          '[$timestamp] $message\n',
+          mode: FileMode.append,
+        );
       } catch (e) {
         // Ignore write errors
       }
@@ -547,47 +598,30 @@ class TorrentService {
   }
 
   Future<String?> _findEnginePath() async {
-    // Extensionless first (macOS/Linux), then .exe (Windows)
+    // Portable discovery: current dir, executable dir, PATH
+    final exeExt = Platform.isWindows ? '.exe' : '';
     final candidates = [
-      'C:/Users/biswa/ShareStream/go/sharestream-engine/sharestream-engine',
-      'C:/Users/biswa/ShareStream/go/sharestream-engine/sharestream-engine.exe',
-      '${Directory.current.path}/go/sharestream-engine/sharestream-engine',
-      '${Directory.current.path}/go/sharestream-engine/sharestream-engine.exe',
-      '${File(Platform.resolvedExecutable).parent.path}/sharestream-engine',
-      '${File(Platform.resolvedExecutable).parent.path}/sharestream-engine.exe',
+      '${Directory.current.path}/go/sharestream-engine/sharestream-engine$exeExt',
+      '${File(Platform.resolvedExecutable).parent.path}/sharestream-engine$exeExt',
     ];
 
     // Add home-directory based path (macOS sandbox workaround)
     final home = Platform.environment['HOME'] ?? '';
     if (home.isNotEmpty) {
-      // macOS sandbox remaps HOME to container path, extract real home
       String realHome = home;
       final containerIdx = home.indexOf('/Library/Containers/');
       if (containerIdx > 0) {
         realHome = home.substring(0, containerIdx);
       }
-      candidates.add('$realHome/ShareStream/go/sharestream-engine/sharestream-engine');
-      candidates.add('$home/ShareStream/go/sharestream-engine/sharestream-engine');
+      candidates.add(
+        '$realHome/ShareStream/go/sharestream-engine/sharestream-engine$exeExt',
+      );
     }
 
-    final exeExt = Platform.isWindows ? '.exe' : '';
-    final debugPath = 'C:/Users/biswa/ShareStream/go/sharestream-engine/cmd/sharestream-engine$exeExt';
-    
-    candidates.add(debugPath);
-
-    candidates.add('sharestream-engine$exeExt');
-
-    candidates.add('${File(Platform.resolvedExecutable).parent.path}/sharestream-engine$exeExt');
-
     for (final path in candidates) {
-      var fullPath = path.replaceAll('\$exeExt', exeExt);
-      fullPath = fullPath.replaceAll('\$\{Directory.current.path\}', Directory.current.path);
-      fullPath = fullPath.replaceAll('\$\{File(Platform.resolvedExecutable).parent.path\}', 
-          File(Platform.resolvedExecutable).parent.path);
-      
-      if (File(fullPath).existsSync()) {
-        _log('[torrent] Found engine at: $fullPath');
-        return fullPath;
+      if (File(path).existsSync()) {
+        _log('[torrent] Found engine at: $path');
+        return path;
       }
     }
 

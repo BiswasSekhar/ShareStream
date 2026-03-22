@@ -1,8 +1,8 @@
 import 'dart:io';
-import 'dart:ui';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:intl/intl.dart';
+import '../services/log_service.dart';
 
 class AppLogger {
   static File? _logFile;
@@ -13,20 +13,24 @@ class AppLogger {
     try {
       final dir = await getApplicationSupportDirectory();
       _logFile = File('${dir.path}/app.log');
-      
+
       // Store original debugPrint
       final originalDebugPrint = debugPrint;
-      
+
       // Override debugPrint to write to file too
       debugPrint = (String? message, {int? wrapWidth}) {
         originalDebugPrint(message, wrapWidth: wrapWidth);
-        _writeToFile('[DEBUG] $message');
+        final safeMessage = message ?? '';
+        LogService.log(safeMessage);
+        _writeToFile('[DEBUG] $safeMessage');
       };
 
       // Catch Flutter framework errors
       FlutterError.onError = (FlutterErrorDetails details) {
         FlutterError.presentError(details);
-        _writeToFile('[FATAL] FlutterError: ${details.exception}\\nStackTrace: ${details.stack}');
+        _writeToFile(
+          '[FATAL] FlutterError: ${details.exception}\\nStackTrace: ${details.stack}',
+        );
       };
 
       // Catch asynchronous Dart errors
@@ -36,9 +40,10 @@ class AppLogger {
       };
 
       _initialized = true;
+      LogService.log('=== App Logger Initialized ===');
       _writeToFile('=== App Logger Initialized ===');
     } catch (e) {
-      print('Failed to initialize logger: $e');
+      debugPrint('Failed to initialize logger: $e');
     }
   }
 
@@ -47,7 +52,10 @@ class AppLogger {
     try {
       final now = DateTime.now();
       final timestamp = DateFormat('yyyy-MM-dd HH:mm:ss.SSS').format(now);
-      _logFile!.writeAsStringSync('[$timestamp] $message\\n', mode: FileMode.append);
+      _logFile!.writeAsStringSync(
+        '[$timestamp] $message\\n',
+        mode: FileMode.append,
+      );
     } catch (e) {
       // Ignore write errors to prevent infinite loops
     }
@@ -72,6 +80,7 @@ class AppLogger {
   static Future<void> clearLogs() async {
     if (_logFile != null && await _logFile!.exists()) {
       await _logFile!.writeAsString('');
+      LogService.log('=== Logs Cleared ===');
       _writeToFile('=== Logs Cleared ===');
     }
   }

@@ -11,7 +11,8 @@ class DeveloperScreen extends StatefulWidget {
   State<DeveloperScreen> createState() => _DeveloperScreenState();
 }
 
-class _DeveloperScreenState extends State<DeveloperScreen> with SingleTickerProviderStateMixin {
+class _DeveloperScreenState extends State<DeveloperScreen>
+    with SingleTickerProviderStateMixin {
   late TabController _tabController;
   final ScrollController _scrollController = ScrollController();
 
@@ -19,13 +20,22 @@ class _DeveloperScreenState extends State<DeveloperScreen> with SingleTickerProv
   void initState() {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
+    _tabController.addListener(_onTabChanged);
   }
 
   @override
   void dispose() {
+    _tabController.removeListener(_onTabChanged);
     _tabController.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  void _onTabChanged() {
+    if (!mounted) return;
+    if (!_tabController.indexIsChanging) {
+      setState(() {});
+    }
   }
 
   void _scrollToBottom() {
@@ -57,7 +67,10 @@ class _DeveloperScreenState extends State<DeveloperScreen> with SingleTickerProv
       builder: (context) => AlertDialog(
         backgroundColor: AppTheme.bgDeep,
         title: const Text('Clear Logs', style: TextStyle(color: Colors.white)),
-        content: const Text('Are you sure you want to clear these logs?', style: TextStyle(color: AppTheme.textSecondary)),
+        content: const Text(
+          'Are you sure you want to clear these logs?',
+          style: TextStyle(color: AppTheme.textSecondary),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
@@ -88,50 +101,71 @@ class _DeveloperScreenState extends State<DeveloperScreen> with SingleTickerProv
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: AppTheme.bgDeep,
-      appBar: AppBar(
-        backgroundColor: AppTheme.bgDeep,
-        title: const Text('Developer Options', style: TextStyle(color: Colors.white)),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back, color: Colors.white),
-          onPressed: () => Navigator.pop(context),
-        ),
-        bottom: TabBar(
-          controller: _tabController,
-          indicatorColor: AppTheme.primary,
-          labelColor: AppTheme.primary,
-          unselectedLabelColor: AppTheme.textMuted,
-          tabs: const [
-            Tab(text: 'Engine Logs'),
-            Tab(text: 'Signal Logs'),
-            Tab(text: 'App Logs'),
-          ],
-        ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.copy, color: Colors.white),
-            tooltip: 'Copy all logs',
-            onPressed: () {
-              final logs = _getCurrentLogs();
-              _copyLogs(logs);
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.delete_outline, color: Colors.white),
-            tooltip: 'Clear logs',
-            onPressed: () => _clearLogs(_tabController.index),
-          ),
-        ],
-      ),
-      body: TabBarView(
-        controller: _tabController,
-        children: [
-          _buildLogList(EngineLogService.engineLogs),
-          _buildLogList(EngineLogService.signalLogs),
-          _buildLogList(LogService.logs),
-        ],
-      ),
+    return ValueListenableBuilder<int>(
+      valueListenable: EngineLogService.engineLogsVersion,
+      builder: (context, engineVersion, child) {
+        return ValueListenableBuilder<int>(
+          valueListenable: EngineLogService.signalLogsVersion,
+          builder: (context, signalVersion, child) {
+            return ValueListenableBuilder<int>(
+              valueListenable: LogService.logsVersion,
+              builder: (context, appVersion, child) {
+                return Scaffold(
+                  backgroundColor: AppTheme.bgDeep,
+                  appBar: AppBar(
+                    backgroundColor: AppTheme.bgDeep,
+                    title: const Text(
+                      'Developer Options',
+                      style: TextStyle(color: Colors.white),
+                    ),
+                    leading: IconButton(
+                      icon: const Icon(Icons.arrow_back, color: Colors.white),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                    bottom: TabBar(
+                      controller: _tabController,
+                      indicatorColor: AppTheme.primary,
+                      labelColor: AppTheme.primary,
+                      unselectedLabelColor: AppTheme.textMuted,
+                      tabs: const [
+                        Tab(text: 'Engine Logs'),
+                        Tab(text: 'Signal Logs'),
+                        Tab(text: 'App Logs'),
+                      ],
+                    ),
+                    actions: [
+                      IconButton(
+                        icon: const Icon(Icons.copy, color: Colors.white),
+                        tooltip: 'Copy all logs',
+                        onPressed: () {
+                          final logs = _getCurrentLogs();
+                          _copyLogs(logs);
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(
+                          Icons.delete_outline,
+                          color: Colors.white,
+                        ),
+                        tooltip: 'Clear logs',
+                        onPressed: () => _clearLogs(_tabController.index),
+                      ),
+                    ],
+                  ),
+                  body: TabBarView(
+                    controller: _tabController,
+                    children: [
+                      _buildLogList(EngineLogService.engineLogs),
+                      _buildLogList(EngineLogService.signalLogs),
+                      _buildLogList(LogService.logs),
+                    ],
+                  ),
+                );
+              },
+            );
+          },
+        );
+      },
     );
   }
 
@@ -153,10 +187,7 @@ class _DeveloperScreenState extends State<DeveloperScreen> with SingleTickerProv
 
     if (logs.isEmpty) {
       return const Center(
-        child: Text(
-          'No logs yet',
-          style: TextStyle(color: AppTheme.textMuted),
-        ),
+        child: Text('No logs yet', style: TextStyle(color: AppTheme.textMuted)),
       );
     }
 

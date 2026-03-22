@@ -1,8 +1,8 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter_animate/flutter_animate.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' as webrtc;
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart' as webrtc;
 import 'package:file_picker/file_picker.dart';
 import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
@@ -35,54 +35,115 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
   bool _controlsVisible = true;
+
+  // Cached provider reference (for safe dispose)
+  late final RoomProvider _provider;
   bool _videoLoaded = false;
-  
+
+  // ─── Stream subscriptions for cleanup ───
+  final List<StreamSubscription> _subscriptions = [];
+
   // ─── Join Requests ───
   final List<Map<String, String>> _pendingJoinRequests = [];
 
   @override
   void initState() {
     super.initState();
+    _provider = context.read<RoomProvider>();
 
     _player = Player(
-      configuration: const PlayerConfiguration(
-        title: 'ShareStream',
-      ),
+      configuration: const PlayerConfiguration(title: 'ShareStream'),
     );
     _videoController = VideoController(
       _player,
       configuration: const VideoControllerConfiguration(
-        enableHardwareAcceleration: false,
+        enableHardwareAcceleration: true,
       ),
     );
 
-    // Listen to player state
-    _player.stream.playing.listen((playing) {
-      if (mounted) setState(() => _isPlaying = playing);
-    });
-    _player.stream.position.listen((pos) {
-      if (mounted) setState(() => _position = pos);
-    });
-    _player.stream.duration.listen((dur) {
-      if (mounted) setState(() => _duration = dur);
-    });
-    _player.stream.completed.listen((completed) {
-      if (completed && mounted) setState(() => _isPlaying = false);
-    });
+    // Listen to player state - store subscriptions for cleanup
+    _subscriptions.add(
+      _player.stream.playing.listen((playing) {
+        if (mounted) setState(() => _isPlaying = playing);
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.position.listen((pos) {
+        if (mounted) setState(() => _position = pos);
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.duration.listen((dur) {
+        if (mounted) setState(() => _duration = dur);
+      }),
+    );
+    _subscriptions.add(
+      _player.stream.completed.listen((completed) {
+        if (completed && mounted) setState(() => _isPlaying = false);
+      }),
+    );
 
     // Wire up socket sync
     final provider = context.read<RoomProvider>();
-    provider.socket.onPlayPauseRequested = (playing) {
+    provider.socket.onControlCommitted =
+        (
+          serverSeq,
+          actionType,
+          targetTime,
+          playWhenReady,
+          initiatorParticipantId,
+        ) {
+          if (!provider.applyControlIfNew(serverSeq)) {
+            return;
+          }
+
+          if (actionType == 'seek' ||
+              actionType == 'play' ||
+              actionType == 'pause') {
+            _player.seek(Duration(milliseconds: (targetTime * 1000).toInt()));
+          }
+          if (actionType == 'play') {
+            _player.play();
+          } else if (actionType == 'pause') {
+            _player.pause();
+          } else {
+            if (playWhenReady) {
+              _player.play();
+            } else {
+              _player.pause();
+            }
+          }
+
+          provider.socket.sendControlAck(
+            serverSeq: serverSeq,
+            currentTimeSec: targetTime,
+            playing: actionType == 'play'
+                ? true
+                : actionType == 'pause'
+                ? false
+                : playWhenReady,
+            bufferedSec: 0,
+          );
+        };
+
+    // Wire player position callbacks for sync
+    provider.playerPositionCallback = () {
+      return _position.inMilliseconds / 1000.0;
+    };
+    provider.playerPlayingCallback = () {
+      return _isPlaying;
+    };
+    provider.playerSeekCallback = (time) {
+      _player.seek(Duration(milliseconds: (time * 1000).toInt()));
+    };
+    provider.playerSetPlayingCallback = (playing) {
       if (playing) {
         _player.play();
       } else {
         _player.pause();
       }
     };
-    provider.socket.onSeekRequested = (pos) {
-      _player.seek(Duration(seconds: pos.toInt()));
-    };
-    
+
     // Handle join requests (for host)
     provider.socket.onJoinRequest = (participantId, name) {
       if (mounted) {
@@ -116,6 +177,26 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    // Cancel stream subscriptions
+    for (final sub in _subscriptions) {
+      sub.cancel();
+    }
+    _subscriptions.clear();
+
+    // Clear socket callbacks to prevent leaked references
+    try {
+      _provider.socket.onPlayPauseRequested = null;
+      _provider.socket.onSeekRequested = null;
+      _provider.socket.onControlCommitted = null;
+      _provider.socket.onJoinRequest = null;
+      _provider.playerPositionCallback = null;
+      _provider.playerPlayingCallback = null;
+      _provider.playerSeekCallback = null;
+      _provider.playerSetPlayingCallback = null;
+    } catch (e) {
+      debugPrint('[room] dispose cleanup error (safe to ignore): $e');
+    }
+
     _player.dispose();
     _chatController.dispose();
     _chatScrollController.dispose();
@@ -155,20 +236,32 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
 
   void _togglePlayPause() {
     final provider = context.read<RoomProvider>();
-    final time = _position.inSeconds.toDouble();
+    final time = _position.inMilliseconds / 1000.0;
     if (_isPlaying) {
-      _player.pause();
-      provider.socket.syncPause(time);
+      provider.socket.sendControlRequest(
+        actionType: 'pause',
+        targetTimeSec: time,
+        playWhenReady: false,
+        baseSeq: provider.lastAppliedControlSeq,
+      );
     } else {
-      _player.play();
-      provider.socket.syncPlay(time);
+      provider.socket.sendControlRequest(
+        actionType: 'play',
+        targetTimeSec: time,
+        playWhenReady: true,
+        baseSeq: provider.lastAppliedControlSeq,
+      );
     }
   }
 
   void _onSeek(double value) {
-    final pos = Duration(seconds: value.toInt());
-    _player.seek(pos);
-    context.read<RoomProvider>().socket.syncSeek(value);
+    final provider = context.read<RoomProvider>();
+    provider.socket.sendControlRequest(
+      actionType: 'seek',
+      targetTimeSec: value,
+      playWhenReady: _isPlaying,
+      baseSeq: provider.lastAppliedControlSeq,
+    );
   }
 
   void _toggleVideoCall() async {
@@ -180,26 +273,37 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
     }
     if (mounted) setState(() {});
   }
-  
+
   void _showJoinRequestDialog(String participantId, String name) {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
         backgroundColor: AppTheme.bgCard,
-        title: const Text('Join Request', style: TextStyle(color: AppTheme.textPrimary)),
-        content: Text('$name wants to join the room.', style: const TextStyle(color: AppTheme.textSecondary)),
+        title: const Text(
+          'Join Request',
+          style: TextStyle(color: AppTheme.textPrimary),
+        ),
+        content: Text(
+          '$name wants to join the room.',
+          style: const TextStyle(color: AppTheme.textSecondary),
+        ),
         actions: [
           TextButton(
             onPressed: () {
               final provider = context.read<RoomProvider>();
               provider.rejectJoin(participantId);
               setState(() {
-                _pendingJoinRequests.removeWhere((r) => r['id'] == participantId);
+                _pendingJoinRequests.removeWhere(
+                  (r) => r['id'] == participantId,
+                );
               });
               Navigator.pop(context);
             },
-            child: const Text('Reject', style: TextStyle(color: AppTheme.error)),
+            child: const Text(
+              'Reject',
+              style: TextStyle(color: AppTheme.error),
+            ),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: AppTheme.success),
@@ -207,7 +311,9 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
               final provider = context.read<RoomProvider>();
               provider.approveJoin(participantId);
               setState(() {
-                _pendingJoinRequests.removeWhere((r) => r['id'] == participantId);
+                _pendingJoinRequests.removeWhere(
+                  (r) => r['id'] == participantId,
+                );
               });
               Navigator.pop(context);
             },
@@ -266,7 +372,8 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                     showChat: _showChat,
                     onLeave: _leaveRoom,
                     onToggleVideoCall: _toggleVideoCall,
-                    onToggleParticipants: () => setState(() => _showParticipants = !_showParticipants),
+                    onToggleParticipants: () =>
+                        setState(() => _showParticipants = !_showParticipants),
                     onToggleChat: () => setState(() => _showChat = !_showChat),
                     pendingJoinRequests: _pendingJoinRequests.length,
                   ),

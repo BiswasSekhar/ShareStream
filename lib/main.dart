@@ -6,7 +6,6 @@ import 'theme/app_theme.dart';
 import 'providers/room_provider.dart';
 import 'screens/home_screen.dart';
 import 'screens/developer_screen.dart';
-import 'services/log_service.dart';
 
 import 'utils/app_logger.dart';
 
@@ -15,11 +14,7 @@ Future<void> main() async {
   await AppLogger.init();
   await dotenv.load(fileName: '.env');
   MediaKit.ensureInitialized();
-  
-  debugPrint = (String? message, {int? wrapWidth}) {
-    LogService.log(message ?? '');
-  };
-  
+
   runApp(const ShareStreamApp());
 }
 
@@ -29,9 +24,7 @@ class ShareStreamApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MultiProvider(
-      providers: [
-        ChangeNotifierProvider(create: (_) => RoomProvider()),
-      ],
+      providers: [ChangeNotifierProvider(create: (_) => RoomProvider())],
       child: MaterialApp(
         title: 'ShareStream',
         debugShowCheckedModeBanner: false,
@@ -40,13 +33,16 @@ class ShareStreamApp extends StatelessWidget {
         onGenerateRoute: (settings) {
           final uri = Uri.parse(settings.name ?? '');
           if (uri.pathSegments.isNotEmpty && uri.pathSegments.first == 'join') {
-            final code = uri.pathSegments.length > 1 ? uri.pathSegments[1] : null;
+            final code = uri.pathSegments.length > 1
+                ? uri.pathSegments[1]
+                : null;
             return MaterialPageRoute(
               builder: (_) => HomeScreen(arguments: code),
               settings: settings,
             );
           }
-          if (uri.pathSegments.isNotEmpty && uri.pathSegments.first == 'developer') {
+          if (uri.pathSegments.isNotEmpty &&
+              uri.pathSegments.first == 'developer') {
             return MaterialPageRoute(
               builder: (_) => const DeveloperScreen(),
               settings: settings,

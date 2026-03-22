@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/bencode"
@@ -72,6 +72,7 @@ func (e *TorrentEngine) CreateTorrentFromFile(filePath string) (string, *metainf
 	mi.AnnounceList = [][]string{
 		{"udp://tracker.opentrackr.org:1337/announce"},
 		{"udp://tracker.openbittorrent.com:6969/announce"},
+		{"http://tracker.opentrackr.org:1337/announce"},
 	}
 
 	t, err := e.client.AddTorrent(mi)
@@ -84,9 +85,15 @@ func (e *TorrentEngine) CreateTorrentFromFile(filePath string) (string, *metainf
 	e.torrents[infoHash] = t
 	e.mu.Unlock()
 
+	// Host already has the file — just verify data, don't DownloadAll
 	go func() {
-		<-t.GotInfo()
-		t.DownloadAll()
+		select {
+		case <-t.GotInfo():
+			// Verify local data so seeding starts
+			t.VerifyData()
+		case <-time.After(60 * time.Second):
+			e.logger.Error("timeout waiting for torrent info (seed)", "infoHash", infoHash)
+		}
 	}()
 
 	return infoHash, mi, nil
@@ -112,8 +119,12 @@ func (e *TorrentEngine) AddMagnet(magnetURI string) (string, error) {
 	e.mu.Unlock()
 
 	go func() {
-		<-t.GotInfo()
-		t.DownloadAll()
+		select {
+		case <-t.GotInfo():
+			t.DownloadAll()
+		case <-time.After(60 * time.Second):
+			e.logger.Error("timeout waiting for torrent info (magnet)", "infoHash", infoHash)
+		}
 	}()
 
 	return infoHash, nil
@@ -136,8 +147,12 @@ func (e *TorrentEngine) AddTorrentFile(torrentPath string) (string, error) {
 	e.mu.Unlock()
 
 	go func() {
-		<-t.GotInfo()
-		t.DownloadAll()
+		select {
+		case <-t.GotInfo():
+			t.DownloadAll()
+		case <-time.After(60 * time.Second):
+			e.logger.Error("timeout waiting for torrent info (file)", "infoHash", infoHash)
+		}
 	}()
 
 	return infoHash, nil
@@ -166,7 +181,11 @@ func (e *TorrentEngine) GetTorrentInfo(infoHash string) (map[string]interface{},
 		return nil, fmt.Errorf("torrent not found")
 	}
 
-	<-t.GotInfo()
+	select {
+	case <-t.GotInfo():
+	case <-time.After(60 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for torrent info")
+	}
 
 	info := t.Info()
 	if info == nil {
@@ -219,7 +238,11 @@ func (e *TorrentEngine) ReadFile(infoHash string, filePath string, offset, lengt
 		return nil, fmt.Errorf("torrent not found")
 	}
 
-	<-t.GotInfo()
+	select {
+	case <-t.GotInfo():
+	case <-time.After(60 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for torrent info")
+	}
 
 	files := t.Files()
 	var file *torrent.File
@@ -296,12 +319,10 @@ func (e *TorrentEngine) CreateMagnetLink(infoHash string) (string, error) {
 		return "", fmt.Errorf("torrent info not available")
 	}
 
-	ihBytes, _ := hex.DecodeString(infoHash)
-	var ih metainfo.Hash
-	copy(ih[:], ihBytes)
-
-	_ = ih
 	magnetURI := fmt.Sprintf("magnet:?xt=urn:btih:%s&dn=%s", infoHash, info.Name)
+	// Append tracker URLs for better peer discovery
+	magnetURI += "&tr=udp://tracker.opentrackr.org:1337/announce"
+	magnetURI += "&tr=udp://tracker.openbittorrent.com:6969/announce"
 	return magnetURI, nil
 }
 
@@ -315,6 +336,33 @@ func (e *TorrentEngine) Close() error {
 
 func (e *TorrentEngine) GetListenPort() int {
 	return e.client.LocalPort()
+}
+
+// AddPeer injects a peer address into all active torrents for direct connection.
+// This is used for peer exchange via the signaling server.
+func (e *TorrentEngine) AddPeer(address string) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if len(e.torrents) == 0 {
+		e.logger.Info("no active torrents to add peer to", "peer", address)
+		return false
+	}
+
+	for _, t := range e.torrents {
+		t.AddPeers([]torrent.PeerInfo{
+			{
+				Addr: torrent.PeerRemoteAddr(peerAddr(address)),
+			},
+		})
+		e.logger.Info("added peer to torrent", "peer", address, "torrent", t.Name())
+	}
+	return true
+}
+
+// GetListenAddr returns the listen address as "host:port" for peer exchange.
+func (e *TorrentEngine) GetListenAddr() string {
+	return fmt.Sprintf("127.0.0.1:%d", e.client.LocalPort())
 }
 
 func (e *TorrentEngine) GetTorrentName(infoHash string) string {
@@ -372,3 +420,9 @@ func (e *TorrentEngine) GetInfo() Info {
 
 	return info
 }
+
+// peerAddr implements net.Addr for direct peer injection
+type peerAddr string
+
+func (a peerAddr) Network() string { return "tcp" }
+func (a peerAddr) String() string  { return string(a) }

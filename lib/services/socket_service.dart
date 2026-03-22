@@ -7,22 +7,33 @@ import 'package:flutter/foundation.dart';
 class SocketService {
   io.Socket? _socket;
   String? _currentRoom;
+  String? _currentServerUrl;
   String? _userId;
   String? _participantId;
   String _userName = 'User';
   bool _isHost = false;
 
   final ValueNotifier<bool> connected = ValueNotifier(false);
+  final ValueNotifier<String?> lastConnectionError = ValueNotifier(null);
   final ValueNotifier<List<Participant>> participants = ValueNotifier([]);
   final ValueNotifier<List<ChatMessage>> messages = ValueNotifier([]);
   final ValueNotifier<String?> magnetUri = ValueNotifier(null);
   final ValueNotifier<String?> streamPath = ValueNotifier(null);
   final ValueNotifier<String?> movieName = ValueNotifier(null);
+  final ValueNotifier<String?> inviteToken = ValueNotifier(null);
 
   // Playback sync callbacks
   void Function(double time)? onSeekRequested;
   void Function(bool playing)? onPlayPauseRequested;
   void Function(String magnet, String path)? onTorrentMagnet;
+  void Function(
+    int serverSeq,
+    String actionType,
+    double targetTime,
+    bool playWhenReady,
+    String initiatorParticipantId,
+  )?
+  onControlCommitted;
 
   // Sync callbacks
   void Function(int timestamp)? onSyncCheck;
@@ -47,32 +58,60 @@ class SocketService {
   void Function(String fromId, Map<String, dynamic> candidate)? onIceCandidate;
   void Function(String peerId)? onPeerLeft;
 
+  // Torrent peer exchange callback
+  void Function(String fromId, String address, int port)? onTorrentPeerInfo;
+
   String? get currentRoom => _currentRoom;
+  String? get currentServerUrl => _currentServerUrl;
   String? get userId => _userId;
+  String? get participantId => _participantId;
   bool get isHost => _isHost;
   bool get isConnected => connected.value;
 
   void connect(String serverUrl) {
+    lastConnectionError.value = null;
+
+    final normalizedServerUrl = _normalizeSocketBaseUrl(serverUrl);
+    _currentServerUrl = normalizedServerUrl;
+
     // If already connected to a different URL, disconnect first
     if (_socket != null) {
-      debugPrint('[socket] Cleaning up previous connection before connecting to: $serverUrl');
+      debugPrint(
+        '[socket] Cleaning up previous connection before connecting to: $normalizedServerUrl',
+      );
       _socket!.disconnect();
       _socket!.dispose();
       _socket = null;
       connected.value = false;
     }
-    
-    debugPrint('[socket] Connecting to: $serverUrl');
-    debugPrint('[socket] Transport: websocket');
-    
-    _socket = io.io(serverUrl, <String, dynamic>{
-      'transports': ['websocket'],
-      'autoConnect': true,
-      'reconnection': true,
-      'reconnectionDelay': 1000,
-      'reconnectionAttempts': 10,
-      'timeout': 20000,
-    });
+
+    debugPrint('[socket] Connecting to: $normalizedServerUrl');
+
+    // Cloudflare tunnels (HTTPS) need polling-first handshake before upgrading to WS.
+    // Localhost can go straight to websocket for lower latency.
+    final isSecure = normalizedServerUrl.startsWith('https');
+    final transports = isSecure
+        ? ['polling', 'websocket']
+        : ['websocket', 'polling'];
+    debugPrint('[socket] Transport order: $transports (isSecure=$isSecure)');
+
+    _socket = io.io(
+      normalizedServerUrl,
+      io.OptionBuilder()
+          .setTransports(transports)
+          .enableForceNew()
+          .enableAutoConnect()
+          .enableReconnection()
+          .setReconnectionDelay(1000)
+          .setReconnectionAttempts(10)
+          .setTimeout(20000)
+          .build(),
+    );
+
+    // Explicitly call connect in case autoConnect is delayed
+    if (!_socket!.connected) {
+      _socket!.connect();
+    }
 
     _socket!.onConnect((_) {
       debugPrint('[socket] ✅ Connected! Socket ID: ${_socket!.id}');
@@ -86,31 +125,60 @@ class SocketService {
     });
 
     _socket!.on('connect_error', (err) {
-      debugPrint('[socket] ❌ Connection error: $err');
-      debugPrint('[socket]    → Make sure signal server is running on $serverUrl');
+      final raw = '$err';
+      var friendly = raw;
+      if (raw.contains('HTTP status code: 530')) {
+        friendly =
+            'Tunnel is unavailable or expired (HTTP 530). Ask host for a fresh invite link.';
+      }
+
+      if (raw.contains(':0/socket.io/')) {
+        friendly =
+            'Invalid tunnel socket endpoint (port resolution issue). Please retry with a fresh link.';
+      }
+
+      lastConnectionError.value = friendly;
+      debugPrint('[socket] ❌ Connection error: $raw');
+      debugPrint(
+        '[socket]    → Make sure signal server is running on $normalizedServerUrl',
+      );
       connected.value = false;
     });
 
     _socket!.on('connect_timeout', (_) {
-      debugPrint('[socket] ❌ Connection timed out to $serverUrl');
+      lastConnectionError.value =
+          'Connection timed out. Check network or verify host link.';
+      debugPrint('[socket] ❌ Connection timed out to $normalizedServerUrl');
       connected.value = false;
     });
 
     _socket!.onReconnect((_) {
       debugPrint('[socket] Reconnected after disconnect');
       connected.value = true;
-      if (_currentRoom != null) {
+      if (_currentRoom != null && _participantId != null) {
         debugPrint('[socket] Re-joining room: $_currentRoom');
-        joinRoom(_currentRoom!, name: 'Reconnecting');
+        _socket?.emit('register-participant', {
+          'participantId': _participantId,
+        });
+        _socket?.emit('join-room', {
+          'code': _currentRoom,
+          'participantId': _participantId,
+          'name': _userName,
+          'capabilities': {'nativePlayback': true},
+        });
       }
     });
 
     _socket!.onReconnectAttempt((attempt) {
-      debugPrint('[socket] Reconnect attempt #$attempt to $serverUrl');
+      debugPrint(
+        '[socket] Reconnect attempt #$attempt to $normalizedServerUrl',
+      );
     });
 
     _socket!.onReconnectFailed((_) {
-      debugPrint('[socket] ❌ Reconnection failed after all attempts to $serverUrl');
+      debugPrint(
+        '[socket] ❌ Reconnection failed after all attempts to $normalizedServerUrl',
+      );
     });
 
     _socket!.onReconnectError((err) {
@@ -126,8 +194,6 @@ class SocketService {
       }
     });
 
-
-
     _socket!.on('participant-left', (data) {
       final leftId = data['id'] as String?;
       debugPrint('[socket] Participant left: $leftId');
@@ -136,7 +202,9 @@ class SocketService {
         final current = List<Participant>.from(participants.value);
         current.removeWhere((p) => p.id == leftId);
         participants.value = current;
-        debugPrint('[socket] Participants list updated: ${current.length} total');
+        debugPrint(
+          '[socket] Participants list updated: ${current.length} total',
+        );
       }
     });
 
@@ -149,7 +217,7 @@ class SocketService {
         onStartWebRTC?.call(peerId, initiator);
       }
     });
-    
+
     // Notify when a new participant joins to start WebRTC
     _socket!.on('participant-joined', (data) {
       final id = data['id'] as String? ?? '';
@@ -160,19 +228,23 @@ class SocketService {
         if (!current.any((p) => p.id == id)) {
           current.add(Participant(id: id, name: name, role: 'viewer'));
           participants.value = current;
-          debugPrint('[socket] Participants list updated: ${current.length} total');
+          debugPrint(
+            '[socket] Participants list updated: ${current.length} total',
+          );
         }
-        
+
         // Don't trigger WebRTC connection to ourselves
         final myId = _participantId ?? _userId ?? '';
         if (id == myId || id == _userId) {
           debugPrint('[socket] Skipping WebRTC trigger for self ($id)');
           return;
         }
-        
+
         // Trigger WebRTC connection to new peer
         final imInitiator = myId.compareTo(id) < 0;
-        debugPrint('[socket] Triggering WebRTC with $id, initiator: $imInitiator');
+        debugPrint(
+          '[socket] Triggering WebRTC with $id, initiator: $imInitiator',
+        );
         onStartWebRTC?.call(id, imInitiator);
       }
     });
@@ -224,22 +296,28 @@ class SocketService {
       debugPrint('[socket] Room mode: ${data['mode']}');
     });
 
-    // Playback Sync Events
-    _socket!.on('sync-play', (data) {
-      final time = (data['time'] as num?)?.toDouble();
-      onPlayPauseRequested?.call(true);
-      if (time != null) onSeekRequested?.call(time);
-    });
+    // Playback control events (server-authoritative, ordered)
+    _socket!.on('control-committed', (data) {
+      final serverSeq = (data['serverSeq'] as num?)?.toInt() ?? 0;
+      final actionType = data['actionType'] as String? ?? '';
+      final targetTime =
+          (data['targetTimeSec'] as num?)?.toDouble() ??
+          (data['time'] as num?)?.toDouble() ??
+          0.0;
+      final playWhenReady =
+          data['playWhenReady'] as bool? ??
+          data['playing'] as bool? ??
+          (actionType == 'play');
+      final initiatorParticipantId =
+          data['initiatorParticipantId'] as String? ?? '';
 
-    _socket!.on('sync-pause', (data) {
-      final time = (data['time'] as num?)?.toDouble();
-      onPlayPauseRequested?.call(false);
-      if (time != null) onSeekRequested?.call(time);
-    });
-
-    _socket!.on('sync-seek', (data) {
-      final time = (data['time'] as num?)?.toDouble();
-      if (time != null) onSeekRequested?.call(time);
+      onControlCommitted?.call(
+        serverSeq,
+        actionType,
+        targetTime,
+        playWhenReady,
+        initiatorParticipantId,
+      );
     });
 
     _socket!.on('playback-snapshot', (data) {
@@ -247,6 +325,22 @@ class SocketService {
       if (playback != null) {
         final time = (playback['time'] as num?)?.toDouble();
         final type = playback['type'] as String?;
+        final serverSeq =
+            (data['serverSeq'] as num?)?.toInt() ??
+            (playback['serverSeq'] as num?)?.toInt() ??
+            0;
+
+        if (onControlCommitted != null && time != null && type != null) {
+          onControlCommitted!.call(
+            serverSeq,
+            type,
+            time,
+            type == 'play',
+            'snapshot',
+          );
+          return;
+        }
+
         if (time != null) onSeekRequested?.call(time);
         if (type == 'play') onPlayPauseRequested?.call(true);
         if (type == 'pause') onPlayPauseRequested?.call(false);
@@ -291,7 +385,7 @@ class SocketService {
     _socket!.on('chat-message', (data) {
       final msgId = data['id'] as String? ?? '';
       final senderId = data['senderId'] ?? '';
-      
+
       // Only deduplicate if message has a real ID (non-empty)
       if (msgId.isNotEmpty) {
         final isDuplicate = messages.value.any((m) => m.id == msgId);
@@ -300,20 +394,20 @@ class SocketService {
           return;
         }
       }
-      
+
       // Generate a unique ID if server didn't provide one
-      final effectiveId = msgId.isNotEmpty 
-          ? msgId 
+      final effectiveId = msgId.isNotEmpty
+          ? msgId
           : '${senderId}_${DateTime.now().millisecondsSinceEpoch}';
-      
+
       final isMe = senderId == _userId || senderId == _participantId;
-      
+
       // Skip messages we sent ourselves (already added locally)
       if (isMe) {
         debugPrint('[socket] Skipping own chat message echo');
         return;
       }
-      
+
       final msg = ChatMessage(
         id: effectiveId,
         senderId: senderId,
@@ -321,7 +415,8 @@ class SocketService {
         senderRole: data['senderRole'] ?? 'viewer',
         text: data['text'] ?? '',
         timestamp: DateTime.fromMillisecondsSinceEpoch(
-          (data['timestamp'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
+          (data['timestamp'] as num?)?.toInt() ??
+              DateTime.now().millisecondsSinceEpoch,
         ),
         isMe: false,
       );
@@ -330,6 +425,17 @@ class SocketService {
 
     _socket!.on('error', (data) {
       debugPrint('[socket] Error: $data');
+    });
+
+    // Torrent Peer Exchange
+    _socket!.on('torrent-peer-info', (data) {
+      final from = data['from'] as String?;
+      final address = data['address'] as String?;
+      final port = (data['port'] as num?)?.toInt() ?? 0;
+      if (from != null && address != null && port > 0) {
+        debugPrint('[socket] Torrent peer info from $from: $address:$port');
+        onTorrentPeerInfo?.call(from, address, port);
+      }
     });
 
     // Join Approval Events
@@ -343,9 +449,9 @@ class SocketService {
     });
 
     _socket!.on('join-approved', (data) {
-      final participantId = data['participantId'] as String?;
-      debugPrint('[socket] Join approved for: $participantId');
-      onJoinApproved?.call(participantId ?? '');
+      final code = data['code'] as String?;
+      debugPrint('[socket] Join approved, room code: $code');
+      onJoinApproved?.call(code ?? '');
     });
 
     _socket!.on('join-rejected', (data) {
@@ -376,9 +482,14 @@ class SocketService {
       if (data != null && data['success'] == true) {
         _currentRoom = data['room']?['code'];
         _isHost = true;
+        inviteToken.value = data['room']?['inviteToken'] as String?;
         // Add self as first participant (host)
         participants.value = [
-          Participant(id: _participantId ?? 'host', name: _userName, role: 'host'),
+          Participant(
+            id: _participantId ?? 'host',
+            name: _userName,
+            role: 'host',
+          ),
         ];
         debugPrint('[socket] Created room: $_currentRoom');
       } else {
@@ -391,11 +502,19 @@ class SocketService {
       if (data != null && data['success'] == true) {
         _currentRoom = data['room']?['code'];
         final role = data['room']?['role'] ?? 'viewer';
-        _isHost = role == 'host';
+        if (!_isHost) {
+          _isHost = role == 'host';
+        }
         // Add self to participant list
         final current = List<Participant>.from(participants.value);
         if (!current.any((p) => p.id == _participantId)) {
-          current.add(Participant(id: _participantId ?? 'viewer', name: _userName, role: role));
+          current.add(
+            Participant(
+              id: _participantId ?? 'viewer',
+              name: _userName,
+              role: role,
+            ),
+          );
           participants.value = current;
         }
         debugPrint('[socket] Joined room: $_currentRoom as $role');
@@ -403,6 +522,21 @@ class SocketService {
         debugPrint('[socket] Join failed: ${data?['error']}');
       }
     });
+  }
+
+  String _normalizeSocketBaseUrl(String raw) {
+    final input = raw.trim();
+    if (input.isEmpty) {
+      return raw;
+    }
+
+    // Strip trailing slashes — Socket.IO appends its own /socket.io/ path
+    String normalized = input;
+    while (normalized.endsWith('/')) {
+      normalized = normalized.substring(0, normalized.length - 1);
+    }
+
+    return normalized;
   }
 
   // Generic emit
@@ -415,6 +549,7 @@ class SocketService {
     _isHost = true;
     _userName = name ?? 'Host';
     _participantId = _generateParticipantId();
+    _socket?.emit('register-participant', {'participantId': _participantId});
     _socket?.emit('create-room', {
       'participantId': _participantId,
       'name': name ?? 'Host',
@@ -428,7 +563,9 @@ class SocketService {
     _userName = name ?? 'Guest';
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
-    debugPrint('[socket] Emitting join-room for code: $normalizedCode, participant: $_participantId');
+    debugPrint(
+      '[socket] Emitting join-room for code: $normalizedCode, participant: $_participantId',
+    );
     // Register participant ID so server can send targeted messages
     _socket?.emit('register-participant', {'participantId': _participantId});
     _socket?.emit('join-room', {
@@ -439,17 +576,20 @@ class SocketService {
     });
   }
 
-  void joinRequest(String code, String name) {
+  void joinRequest(String code, String name, {String? inviteTokenValue}) {
     _userName = name;
     _participantId ??= _generateParticipantId();
     final normalizedCode = code.trim().toUpperCase();
-    debugPrint('[socket] Sending join-request for code: $normalizedCode, participant: $_participantId');
+    debugPrint(
+      '[socket] Sending join-request for code: $normalizedCode, participant: $_participantId',
+    );
     // Register participant ID so server can send targeted messages
     _socket?.emit('register-participant', {'participantId': _participantId});
     _socket?.emit('join-request', {
       'code': normalizedCode,
       'participantId': _participantId,
       'name': name,
+      'inviteToken': inviteTokenValue ?? inviteToken.value,
     });
   }
 
@@ -458,7 +598,9 @@ class SocketService {
       'participantId': participantId,
       'code': _currentRoom,
     });
-    debugPrint('[socket] Approved join for: $participantId in room: $_currentRoom');
+    debugPrint(
+      '[socket] Approved join for: $participantId in room: $_currentRoom',
+    );
   }
 
   void rejectJoin(String participantId) {
@@ -466,20 +608,22 @@ class SocketService {
       'participantId': participantId,
       'code': _currentRoom,
     });
-    debugPrint('[socket] Rejected join for: $participantId in room: $_currentRoom');
+    debugPrint(
+      '[socket] Rejected join for: $participantId in room: $_currentRoom',
+    );
   }
 
   void requestJoinApproval() {
     if (_currentRoom == null || _participantId == null) return;
-    _socket?.emit('request-join-status', {
-      'roomCode': _currentRoom,
+    _socket?.emit('request-join-approval', {
+      'code': _currentRoom,
       'participantId': _participantId,
     });
   }
 
   void leaveRoom() {
     if (_currentRoom != null) {
-      _socket?.emit('leave-room');
+      _socket?.emit('leave-room', {'code': _currentRoom});
       _currentRoom = null;
       _isHost = false;
       participants.value = [];
@@ -487,6 +631,7 @@ class SocketService {
       magnetUri.value = null;
       streamPath.value = null;
       movieName.value = null;
+      inviteToken.value = null;
     }
   }
 
@@ -500,39 +645,49 @@ class SocketService {
   }
 
   void emitMovieLoaded(String name, double duration) {
-    _socket?.emit('movie-loaded', {
-      'name': name,
-      'duration': duration,
+    _socket?.emit('movie-loaded', {'name': name, 'duration': duration});
+  }
+
+  // Playback control (shared authority, server-ordered)
+  void sendControlRequest({
+    required String actionType,
+    required double targetTimeSec,
+    required bool playWhenReady,
+    int? baseSeq,
+  }) {
+    _socket?.emit('control-request', {
+      'code': _currentRoom,
+      'participantId': _participantId ?? _userId ?? '',
+      'actionId':
+          '${_participantId ?? _userId ?? 'unknown'}_${DateTime.now().microsecondsSinceEpoch}',
+      'actionType': actionType,
+      'targetTimeSec': targetTimeSec,
+      'playWhenReady': playWhenReady,
+      'baseSeq': baseSeq ?? 0,
+      'sentAtMs': DateTime.now().millisecondsSinceEpoch,
     });
   }
 
-  // Playback Sync
-  void syncPlay(double time) {
-    _socket?.emit('sync-play', {
-      'time': time,
-      'actionId': DateTime.now().millisecondsSinceEpoch.toString(),
-    });
-  }
-
-  void syncPause(double time) {
-    _socket?.emit('sync-pause', {
-      'time': time,
-      'actionId': DateTime.now().millisecondsSinceEpoch.toString(),
-    });
-  }
-
-  void syncSeek(double time) {
-    _socket?.emit('sync-seek', {
-      'time': time,
-      'actionId': DateTime.now().millisecondsSinceEpoch.toString(),
+  void sendControlAck({
+    required int serverSeq,
+    required double currentTimeSec,
+    required bool playing,
+    required double bufferedSec,
+  }) {
+    _socket?.emit('control-ack', {
+      'code': _currentRoom,
+      'serverSeq': serverSeq,
+      'participantId': _participantId ?? _userId ?? '',
+      'currentTimeSec': currentTimeSec,
+      'playing': playing,
+      'bufferedSec': bufferedSec,
+      'sentAtMs': DateTime.now().millisecondsSinceEpoch,
     });
   }
 
   // Sync Actions (New)
   void syncCheck(String code) {
-    _socket?.emit('sync-check', {
-      'code': code,
-    });
+    _socket?.emit('sync-check', {'code': code});
   }
 
   void syncReport(String code, double time, bool playing, double buffered) {
@@ -546,6 +701,7 @@ class SocketService {
 
   void syncCorrect(String participantId, double time, bool playing) {
     _socket?.emit('sync-correct', {
+      'code': _currentRoom,
       'participantId': participantId,
       'time': time,
       'playing': playing,
@@ -565,7 +721,7 @@ class SocketService {
     // Generate client-side message ID for deduplication
     final msgId = '${_participantId}_${DateTime.now().millisecondsSinceEpoch}';
     final timestamp = DateTime.now().millisecondsSinceEpoch;
-    
+
     _socket?.emit('chat-message', {
       'text': text,
       'id': msgId,
@@ -574,7 +730,7 @@ class SocketService {
       'senderRole': _isHost ? 'host' : 'viewer',
       'timestamp': timestamp,
     });
-    
+
     // Add to local messages immediately (sender doesn't wait for echo)
     final msg = ChatMessage(
       id: msgId,
@@ -599,12 +755,22 @@ class SocketService {
     debugPrint('[socket] Sent start-playback for room: $code');
   }
 
+  // Torrent Peer Exchange
+  void emitTorrentPeerInfo(String address, int port) {
+    _socket?.emit('torrent-peer-info', {
+      'address': address,
+      'port': port,
+    });
+    debugPrint('[socket] Sent torrent-peer-info: $address:$port');
+  }
+
   void disconnect() {
     leaveRoom();
     _socket?.disconnect();
     _socket?.dispose();
     _socket = null;
     connected.value = false;
+    lastConnectionError.value = null;
   }
 
   void dispose() {
@@ -615,6 +781,8 @@ class SocketService {
     magnetUri.dispose();
     streamPath.dispose();
     movieName.dispose();
+    inviteToken.dispose();
+    lastConnectionError.dispose();
   }
 
   String _generateParticipantId() {

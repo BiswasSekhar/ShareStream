@@ -34,15 +34,31 @@ class TopBarWidget extends StatelessWidget {
     // Use shareUrl (tunnel URL for host) so external viewers can connect
     final url = provider.shareUrl;
     if (code != null) {
-      final copyText = url != null ? '$url#$code' : code;
+      final token = provider.inviteToken;
+      String copyText;
+      if (url != null) {
+        copyText = token != null && token.isNotEmpty
+            ? '$url#$code:$token'
+            : '$url#$code';
+      } else {
+        copyText = token != null && token.isNotEmpty ? '$code:$token' : code;
+      }
       Clipboard.setData(ClipboardData(text: copyText));
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Row(
             children: [
-              const Icon(Icons.check_circle_outline, color: AppTheme.success, size: 18),
+              const Icon(
+                Icons.check_circle_outline,
+                color: AppTheme.success,
+                size: 18,
+              ),
               const SizedBox(width: 10),
-              const Expanded(child: Text('Room link copied! Share this with your friends to let them join.')),
+              const Expanded(
+                child: Text(
+                  'Room link copied! Share this with your friends to let them join.',
+                ),
+              ),
             ],
           ),
           duration: const Duration(seconds: 3),
@@ -85,16 +101,25 @@ class TopBarWidget extends StatelessWidget {
             child: GestureDetector(
               onTap: () => _copyRoomCode(context),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 8,
+                ),
                 decoration: BoxDecoration(
                   color: AppTheme.primary.withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: AppTheme.primary.withValues(alpha: 0.3)),
+                  border: Border.all(
+                    color: AppTheme.primary.withValues(alpha: 0.3),
+                  ),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.tag_rounded, size: 16, color: AppTheme.primaryLight),
+                    const Icon(
+                      Icons.tag_rounded,
+                      size: 16,
+                      color: AppTheme.primaryLight,
+                    ),
                     const SizedBox(width: 6),
                     Text(
                       provider.roomCode ?? '—',
@@ -106,7 +131,11 @@ class TopBarWidget extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(width: 6),
-                    const Icon(Icons.copy_rounded, size: 14, color: AppTheme.textMuted),
+                    const Icon(
+                      Icons.copy_rounded,
+                      size: 14,
+                      color: AppTheme.textMuted,
+                    ),
                   ],
                 ),
               ),
@@ -118,7 +147,10 @@ class TopBarWidget extends StatelessWidget {
             valueListenable: provider.participants,
             builder: (_, participants, __) {
               return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: AppTheme.bgElevated,
                   borderRadius: BorderRadius.circular(8),
@@ -126,7 +158,11 @@ class TopBarWidget extends StatelessWidget {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.people_outline_rounded, size: 16, color: AppTheme.textSecondary),
+                    const Icon(
+                      Icons.people_outline_rounded,
+                      size: 16,
+                      color: AppTheme.textSecondary,
+                    ),
                     const SizedBox(width: 6),
                     Text(
                       '${participants.length}',
@@ -156,7 +192,9 @@ class TopBarWidget extends StatelessWidget {
                 tooltip: inCall ? 'End Call' : 'Start Video Call',
                 style: inCall
                     ? IconButton.styleFrom(
-                        backgroundColor: AppTheme.accent.withValues(alpha: 0.15),
+                        backgroundColor: AppTheme.accent.withValues(
+                          alpha: 0.15,
+                        ),
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(10),
                         ),
@@ -173,7 +211,9 @@ class TopBarWidget extends StatelessWidget {
                 icon: Icon(
                   Icons.people_alt_rounded,
                   size: 20,
-                  color: showParticipants ? AppTheme.primary : AppTheme.textMuted,
+                  color: showParticipants
+                      ? AppTheme.primary
+                      : AppTheme.textMuted,
                 ),
                 tooltip: 'Participants',
               ),

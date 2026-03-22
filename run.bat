@@ -6,6 +6,12 @@ setlocal enabledelayedexpansion
 
 echo [=== ShareStream Launcher ===]
 
+:: Kill any lingering processes before starting
+echo [Cleaning up older instances...]
+taskkill /F /IM sharestream-signal.exe >nul 2>&1
+taskkill /F /IM cloudflared.exe >nul 2>&1
+taskkill /F /IM sharestream-engine.exe >nul 2>&1
+
 :: Parse arguments
 set BUILD_GO=false
 set NO_TUNNEL=false
@@ -116,8 +122,10 @@ echo.
 flutter run -d windows %*
 
 :: Cleanup
-echo [Cleaning up...]
+echo [Cleaning up processes...]
 taskkill /F /IM sharestream-signal.exe >nul 2>&1
+taskkill /F /IM cloudflared.exe >nul 2>&1
+taskkill /F /IM sharestream-engine.exe >nul 2>&1
 echo [Done]
 
 endlocal

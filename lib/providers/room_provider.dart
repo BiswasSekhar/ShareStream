@@ -14,6 +14,7 @@ class RoomProvider extends ChangeNotifier {
 
   // ─── State ───
   String? _roomCode;
+  String? _inviteToken;
   String _userName = 'User';
   bool _isHost = false;
   bool _inRoom = false;
@@ -24,10 +25,10 @@ class RoomProvider extends ChangeNotifier {
   double _downloadProgress = 0;
   bool _isProcessing = false;
   String _serverUrl = dotenv.env['SERVER_URL'] ?? 'http://localhost:3001';
-  
+
   // Tunnel URL for sharing (external viewers use this)
   String? _tunnelUrl;
-  
+
   // Join approval state
   bool _joinPending = false;
   bool _joinApproved = false;
@@ -37,13 +38,23 @@ class RoomProvider extends ChangeNotifier {
   Timer? _syncTimer;
   final Map<String, double> _viewerDrifts = {};
   static const double _maxDriftSeconds = 2.0;
+  int _lastAppliedControlSeq = 0;
+
+  // Player position callback — set by RoomScreen to report actual playback position
+  double Function()? playerPositionCallback;
+  bool Function()? playerPlayingCallback;
+  void Function(double time)? playerSeekCallback;
+  void Function(bool playing)? playerSetPlayingCallback;
 
   RoomProvider() {
     _webrtc = WebRTCService(_socket);
 
     // Listen for incoming magnet URIs from other participants
     _socket.onTorrentMagnet = _onTorrentMagnet;
-    
+
+    // Torrent peer exchange — receive peer addresses from signal server
+    _socket.onTorrentPeerInfo = _onTorrentPeerInfo;
+
     // Join approval callbacks
     _socket.onJoinRequest = _onJoinRequest;
     _socket.onJoinApproved = _onJoinApproved;
@@ -61,6 +72,7 @@ class RoomProvider extends ChangeNotifier {
   WebRTCService get webrtc => _webrtc;
   TorrentService get torrent => _torrent;
   String? get roomCode => _roomCode;
+  String? get inviteToken => _inviteToken;
   String get userName => _userName;
   bool get isHost => _isHost;
   bool get inRoom => _inRoom;
@@ -71,18 +83,27 @@ class RoomProvider extends ChangeNotifier {
   double get downloadProgress => _downloadProgress;
   bool get isProcessing => _isProcessing;
   String get serverUrl => _serverUrl;
-  
+
   /// URL for sharing with viewers (tunnel URL if available)
   String? get shareUrl => _tunnelUrl ?? _serverUrl;
 
   ValueNotifier<List<Participant>> get participants => _socket.participants;
   ValueNotifier<List<ChatMessage>> get messages => _socket.messages;
   ValueNotifier<bool> get connected => _socket.connected;
-  
+
   // Join approval getters
   bool get joinPending => _joinPending;
   bool get joinApproved => _joinApproved;
   bool get joinRejected => _joinRejected;
+  int get lastAppliedControlSeq => _lastAppliedControlSeq;
+
+  bool applyControlIfNew(int seq) {
+    if (seq <= _lastAppliedControlSeq) {
+      return false;
+    }
+    _lastAppliedControlSeq = seq;
+    return true;
+  }
 
   void setServerUrl(String url, {String? tunnelUrl}) {
     debugPrint('[provider] setServerUrl called:');
@@ -105,40 +126,55 @@ class RoomProvider extends ChangeNotifier {
     notifyListeners();
 
     debugPrint('[room] createRoom() → connecting to $_serverUrl');
-    _socket.connect(_serverUrl);
+
+    // Fix Dart IPv6 localhost resolution bug on Windows
+    String connectUrl = _serverUrl.replaceAll('localhost', '127.0.0.1');
+    _socket.connect(connectUrl);
+    _webrtc.refreshIceServers();
 
     // Wait for connection (polling transport through Cloudflare can take 3-5s)
     await Future.delayed(const Duration(milliseconds: 500));
     int retries = 0;
     while (!_socket.isConnected && retries < 20) {
-      debugPrint('[room] Waiting for connection... attempt ${retries + 1}/20 (connected=${_socket.isConnected})');
+      debugPrint(
+        '[room] Waiting for connection... attempt ${retries + 1}/20 (connected=${_socket.isConnected})',
+      );
       await Future.delayed(const Duration(milliseconds: 300));
       retries++;
     }
 
     if (!_socket.isConnected) {
-      debugPrint('[room] ❌ Failed to connect after ${retries * 300 + 500}ms. Check that the server is running on $_serverUrl');
+      debugPrint(
+        '[room] ❌ Failed to connect after ${retries * 300 + 500}ms. Check that the server is running on $_serverUrl',
+      );
       _error = 'Could not connect to server at $_serverUrl';
       notifyListeners();
       return '';
     }
 
-    debugPrint('[room] ✅ Connected — emitting create-room for user: $_userName');
+    debugPrint(
+      '[room] ✅ Connected — emitting create-room for user: $_userName',
+    );
     _socket.createRoom(name: _userName);
 
     // Wait for room-created event (Go server emits it as a separate event)
     int roomRetries = 0;
     while (_socket.currentRoom == null && roomRetries < 20) {
       if (roomRetries % 5 == 0) {
-        debugPrint('[room] Waiting for room-created event... attempt ${roomRetries + 1}/20');
+        debugPrint(
+          '[room] Waiting for room-created event... attempt ${roomRetries + 1}/20',
+        );
       }
       await Future.delayed(const Duration(milliseconds: 150));
       roomRetries++;
     }
-    
+
     _roomCode = _socket.currentRoom;
+    _inviteToken = _socket.inviteToken.value;
     if (_roomCode == null || _roomCode!.isEmpty) {
-      debugPrint('[room] ❌ No room-created event received after ${roomRetries * 150}ms. The server may be rejecting the event.');
+      debugPrint(
+        '[room] ❌ No room-created event received after ${roomRetries * 150}ms. The server may be rejecting the event.',
+      );
       _error = 'Failed to create room — no response from server';
       notifyListeners();
       return '';
@@ -156,7 +192,9 @@ class RoomProvider extends ChangeNotifier {
     _isHost = false;
     notifyListeners();
 
-    _socket.connect(_serverUrl);
+    String connectUrl = _serverUrl.replaceAll('localhost', '127.0.0.1');
+    _socket.connect(connectUrl);
+    _webrtc.refreshIceServers();
 
     await Future.delayed(const Duration(milliseconds: 500));
     int retries = 0;
@@ -166,15 +204,27 @@ class RoomProvider extends ChangeNotifier {
     }
 
     if (!_socket.isConnected) {
-      _error = 'Could not connect to server';
+      _error =
+          _socket.lastConnectionError.value ?? 'Could not connect to server';
       notifyListeners();
       return false;
     }
 
     _socket.joinRoom(_roomCode!, name: _userName);
-    _inRoom = true;
+
+    int roomRetries = 0;
+    while (_socket.currentRoom == null && roomRetries < 20) {
+      await Future.delayed(const Duration(milliseconds: 150));
+      roomRetries++;
+    }
+
+    final joined = _socket.currentRoom != null;
+    _inRoom = joined;
+    if (!joined) {
+      _error = 'Failed to join room — no response from server';
+    }
     notifyListeners();
-    return true;
+    return joined;
   }
 
   /// Request to join a room (sends join request, waits for approval)
@@ -185,9 +235,18 @@ class RoomProvider extends ChangeNotifier {
     _joinRejected = false;
     _roomCode = code.toUpperCase().trim();
     _isHost = false;
+
+    if (_inviteToken == null || _inviteToken!.isEmpty) {
+      _error =
+          'This room requires an invite token. Use the full invite link from host.';
+      notifyListeners();
+      return false;
+    }
+
     notifyListeners();
 
-    _socket.connect(_serverUrl);
+    String connectUrl = _serverUrl.replaceAll('localhost', '127.0.0.1');
+    _socket.connect(connectUrl);
 
     await Future.delayed(const Duration(milliseconds: 500));
     int retries = 0;
@@ -197,13 +256,21 @@ class RoomProvider extends ChangeNotifier {
     }
 
     if (!_socket.isConnected) {
-      _error = 'Could not connect to server';
+      final err = _socket.lastConnectionError.value;
+      if (err != null &&
+          (err.contains('HTTP 530') || err.toLowerCase().contains('stale'))) {
+        _error = 'Invite link tunnel is stale. Ask host for a fresh link.';
+      } else {
+        _error = err ?? 'Could not connect to server';
+      }
       notifyListeners();
       return false;
     }
 
-    _socket.joinRequest(_roomCode!, _userName);
-    _inRoom = true;
+    _socket.joinRequest(_roomCode!, _userName, inviteTokenValue: _inviteToken);
+    // Don't set _inRoom = true here — wait for room-joined success
+    _joinPending = true;
+    _inRoom = false;
     notifyListeners();
     return true;
   }
@@ -232,11 +299,28 @@ class RoomProvider extends ChangeNotifier {
     _joinPending = false;
     _joinApproved = true;
     _joinRejected = false;
-    debugPrint('[room] Join approved - now joining room $_roomCode as $_userName');
+    debugPrint(
+      '[room] Join approved - now joining room $_roomCode as $_userName',
+    );
     // Actually join the room after approval
     if (_roomCode != null) {
       _socket.joinRoom(_roomCode!, name: _userName);
       debugPrint('[room] Sent join-room request');
+
+      Future(() async {
+        int roomRetries = 0;
+        while (_socket.currentRoom == null && roomRetries < 20) {
+          await Future.delayed(const Duration(milliseconds: 150));
+          roomRetries++;
+        }
+
+        final joined = _socket.currentRoom != null;
+        _inRoom = joined;
+        if (!joined) {
+          _error = 'Failed to join room after approval';
+        }
+        notifyListeners();
+      });
     } else {
       debugPrint('[room] ERROR: _roomCode is null!');
     }
@@ -276,12 +360,20 @@ class RoomProvider extends ChangeNotifier {
     _inRoom = false;
     _isHost = false;
     _roomCode = null;
+    _inviteToken = null;
     _selectedFilePath = null;
     _selectedFileName = null;
     _isStreaming = false;
     _downloadProgress = 0;
     _isProcessing = false;
+    _lastAppliedControlSeq = 0;
     resetJoinState();
+    notifyListeners();
+  }
+
+  void setInviteToken(String? token) {
+    _inviteToken = token;
+    _socket.inviteToken.value = token;
     notifyListeners();
   }
 
@@ -331,7 +423,8 @@ class RoomProvider extends ChangeNotifier {
       final magnet = _torrent.magnetUri.value;
       if (magnet != null) {
         // Validate magnet before sharing
-        if (!magnet.startsWith('magnet:?') || !magnet.contains('xt=urn:btih:')) {
+        if (!magnet.startsWith('magnet:?') ||
+            !magnet.contains('xt=urn:btih:')) {
           debugPrint('[room] Invalid magnet URI generated, skipping share');
         } else {
           _socket.shareMagnet(magnet, 'direct', fileName);
@@ -392,6 +485,12 @@ class RoomProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Handle incoming peer info from signaling server (peer exchange)
+  void _onTorrentPeerInfo(String fromId, String address, int port) {
+    debugPrint('[room] Received torrent peer info from $fromId: $address:$port');
+    _torrent.addPeer('$address:$port');
+  }
+
   void setSelectedFile(String path, String name) {
     _selectedFilePath = path;
     _selectedFileName = name;
@@ -441,23 +540,38 @@ class RoomProvider extends ChangeNotifier {
 
   void _onSyncCheck(int timestamp) {
     if (_roomCode == null) return;
-    debugPrint('[room] Received sync-check from host, responding with report');
-    _socket.syncReport(_roomCode!, 0, true, 0);
+    final currentPos = playerPositionCallback?.call() ?? 0;
+    final isPlaying = playerPlayingCallback?.call() ?? false;
+    debugPrint(
+      '[room] Received sync-check from host, responding with report (pos=$currentPos)',
+    );
+    _socket.syncReport(_roomCode!, currentPos, isPlaying, 0);
   }
 
   void _onSyncReport(String participantId, double playbackTime, bool playing) {
     if (!_isHost || _roomCode == null) return;
-    final drift = playbackTime;
+    // Get host's actual position to compute real drift
+    final hostPos = playerPositionCallback?.call() ?? 0;
+    final drift = hostPos - playbackTime;
     _viewerDrifts[participantId] = drift;
-    debugPrint('[room] Sync report from $participantId: drift=${drift.toStringAsFixed(2)}s');
+    debugPrint(
+      '[room] Sync report from $participantId: viewerPos=${playbackTime.toStringAsFixed(2)}, hostPos=${hostPos.toStringAsFixed(2)}, drift=${drift.toStringAsFixed(2)}s',
+    );
     if (drift.abs() > _maxDriftSeconds) {
-      debugPrint('[room] Correcting $participantId (drift: ${drift.toStringAsFixed(2)}s)');
-      _socket.syncCorrect(participantId, 0, playing);
+      debugPrint(
+        '[room] Correcting $participantId (drift: ${drift.toStringAsFixed(2)}s)',
+      );
+      _socket.syncCorrect(participantId, hostPos, playing);
     }
   }
 
   void _onSyncCorrect(double time, bool playing, String actionId) {
-    debugPrint('[room] Received sync-correct: time=$time, playing=$playing');
+    debugPrint(
+      '[room] Received sync-correct: seeking to time=$time, playing=$playing',
+    );
+    // Actually seek the player to the corrected position
+    playerSeekCallback?.call(time);
+    playerSetPlayingCallback?.call(playing);
   }
 
   @override

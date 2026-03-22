@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,21 @@ type Server struct {
 	listener net.Listener
 }
 
+// corsMiddleware adds CORS headers to all responses.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Range, Content-Type")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func New(eng *engine.TorrentEngine, addr string, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 	s := &Server{
@@ -33,7 +49,7 @@ func New(eng *engine.TorrentEngine, addr string, logger *slog.Logger) *Server {
 
 	s.http = &http.Server{
 		Addr:    addr,
-		Handler: mux,
+		Handler: corsMiddleware(mux),
 	}
 
 	return s
@@ -52,7 +68,7 @@ func NewWithListener(eng *engine.TorrentEngine, listener net.Listener, logger *s
 	mux.HandleFunc("/torrent/", s.handleTorrentInfo)
 
 	s.http = &http.Server{
-		Handler: mux,
+		Handler: corsMiddleware(mux),
 	}
 
 	return s
@@ -68,6 +84,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	infoHash := parts[0]
 	filePath := parts[1]
+
+	// Reject path traversal attempts
+	if strings.Contains(filePath, "..") || strings.HasPrefix(filePath, "/") {
+		http.Error(w, "invalid file path", http.StatusBadRequest)
+		return
+	}
 
 	t := s.engine.GetTorrent(infoHash)
 	if t == nil {
@@ -91,6 +113,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	totalSize := file.Length()
+
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader != "" {
+		s.handleRangeRequest(w, r, infoHash, filePath, totalSize)
+		return
+	}
+
+	// Full file request — create reader from offset 0
 	reader, err := s.engine.ReadFile(infoHash, filePath, 0, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -98,20 +129,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer reader.Close()
 
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		s.handleRangeRequest(w, r, reader, file.Length(), filePath)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.FormatInt(file.Length(), 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	io.Copy(w, reader)
 }
 
-func (s *Server) handleRangeRequest(w http.ResponseWriter, r *http.Request, reader io.ReadCloser, totalSize int64, filePath string) {
+func (s *Server) handleRangeRequest(w http.ResponseWriter, r *http.Request, infoHash, filePath string, totalSize int64) {
 	rangeHeader := r.Header.Get("Range")
 	parts := strings.SplitN(rangeHeader, "=", 2)
 	if len(parts) != 2 {
@@ -138,17 +163,14 @@ func (s *Server) handleRangeRequest(w http.ResponseWriter, r *http.Request, read
 
 	length := end - start + 1
 
-	seeker, ok := reader.(io.Seeker)
-	if !ok {
-		http.Error(w, "seeker not available", http.StatusInternalServerError)
-		return
-	}
-
-	_, err := seeker.Seek(start, io.SeekStart)
+	// Create a NEW reader at the correct offset instead of trying to seek
+	reader, err := s.engine.ReadFile(infoHash, filePath, start, length)
 	if err != nil {
+		s.logger.Error("failed to create reader for range request", "error", err, "start", start, "length", length)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	defer reader.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
@@ -156,33 +178,16 @@ func (s *Server) handleRangeRequest(w http.ResponseWriter, r *http.Request, read
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(http.StatusPartialContent)
 
-	limitedReader := &limitedReader{reader: reader, limit: length}
-	io.Copy(w, limitedReader)
-}
-
-type limitedReader struct {
-	reader io.Reader
-	limit  int64
-	read   int64
-}
-
-func (lr *limitedReader) Read(p []byte) (n int, err error) {
-	if lr.read >= lr.limit {
-		return 0, io.EOF
-	}
-	remaining := lr.limit - lr.read
-	if int64(len(p)) > remaining {
-		p = p[:remaining]
-	}
-	n, err = lr.reader.Read(p)
-	lr.read += int64(n)
-	return n, err
+	io.Copy(w, reader)
 }
 
 func (s *Server) handleTorrents(w http.ResponseWriter, r *http.Request) {
 	torrents := s.engine.ListTorrents()
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"torrents": %v}`, torrents)
+	resp := map[string]interface{}{
+		"torrents": torrents,
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleTorrentInfo(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +204,7 @@ func (s *Server) handleTorrentInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, "%v", info)
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *Server) Start() error {

@@ -14,10 +14,11 @@ import (
 
 // Flutter-compatible protocol
 type Command struct {
-	Cmd        string `json:"cmd"`
-	FilePath   string `json:"filePath,omitempty"`
-	MagnetURI  string `json:"magnetURI,omitempty"`
-	TrackerURL string `json:"trackerUrl,omitempty"`
+	Cmd         string `json:"cmd"`
+	FilePath    string `json:"filePath,omitempty"`
+	MagnetURI   string `json:"magnetURI,omitempty"`
+	TrackerURL  string `json:"trackerUrl,omitempty"`
+	PeerAddress string `json:"peerAddress,omitempty"`
 }
 
 type Event struct {
@@ -50,8 +51,7 @@ func (ipc *IPC) Run() error {
 	reader := bufio.NewReader(os.Stdin)
 	writer := os.Stdout
 
-	// Send ready event with port info
-	ipc.sendEvent(writer, Event{Event: "ready"})
+	// Ready event is sent by main.go (with port), not here
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -82,6 +82,8 @@ func (ipc *IPC) handleCommand(writer *os.File, cmd Command) {
 		ipc.handleSeed(writer, cmd)
 	case "add":
 		ipc.handleAdd(writer, cmd)
+	case "add-peer":
+		ipc.handleAddPeer(writer, cmd)
 	case "stop":
 		ipc.handleStop(writer)
 	case "quit":
@@ -111,7 +113,7 @@ func (ipc *IPC) handleSeed(writer *os.File, cmd Command) {
 		magnetURI = mi.Magnet(nil, nil).String()
 	}
 
-	serverURL := fmt.Sprintf("http://localhost:%d/%s", ipc.httpPort, infoHash)
+	serverURL := fmt.Sprintf("http://localhost:%d/stream/%s", ipc.httpPort, infoHash)
 	name := ipc.engine.GetTorrentName(infoHash)
 
 	ipc.sendEvent(writer, Event{
@@ -132,7 +134,7 @@ func (ipc *IPC) handleAdd(writer *os.File, cmd Command) {
 		return
 	}
 
-	serverURL := fmt.Sprintf("http://localhost:%d/%s", ipc.httpPort, infoHash)
+	serverURL := fmt.Sprintf("http://localhost:%d/stream/%s", ipc.httpPort, infoHash)
 	name := ipc.engine.GetTorrentName(infoHash)
 
 	ipc.sendEvent(writer, Event{
@@ -165,6 +167,22 @@ func (ipc *IPC) handleInfo(writer *os.File) {
 	})
 }
 
+func (ipc *IPC) handleAddPeer(writer *os.File, cmd Command) {
+	if cmd.PeerAddress == "" {
+		ipc.sendEvent(writer, Event{
+			Event:   "error",
+			Message: "peerAddress is required",
+		})
+		return
+	}
+
+	added := ipc.engine.AddPeer(cmd.PeerAddress)
+	ipc.sendEvent(writer, Event{
+		Event:   "peer-added",
+		Message: fmt.Sprintf("peer %s added=%v", cmd.PeerAddress, added),
+	})
+}
+
 func (ipc *IPC) sendEvent(writer *os.File, event Event) {
 	ipc.mu.Lock()
 	defer ipc.mu.Unlock()
@@ -175,9 +193,4 @@ func (ipc *IPC) sendEvent(writer *os.File, event Event) {
 		return
 	}
 	writer.Write(append(b, '\n'))
-}
-
-// StartProgressReporter sends periodic progress updates
-func (ipc *IPC) StartProgressReporter(writer *os.File) {
-	// This would need to be called from main.go with a ticker
 }

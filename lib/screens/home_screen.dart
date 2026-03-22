@@ -13,7 +13,7 @@ import 'developer_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final String? arguments;
-  
+
   const HomeScreen({super.key, this.arguments});
 
   @override
@@ -31,7 +31,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   bool _showSettings = false;
   bool _isDetecting = false;
   bool _serverReady = false;
-  
+  bool _prewarmStarted = false;
+
   // Store tunnel URL for sharing with viewers (host uses localhost)
   String? _tunnelUrl;
 
@@ -47,6 +48,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       }
       _parseInitialRoute();
       _detectServerUrl();
+      _prewarmHostingServices();
     });
   }
 
@@ -65,36 +67,20 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     const ports = [3001, 3002];
 
     try {
-      final torrent = TorrentService();
-      await torrent.checkAndStartSignalServer();
-
-      // Check for tunnel URL from the service
-      _tunnelUrl = TorrentService.tunnelUrl;
-      if (_tunnelUrl != null) {
-        debugPrint('[home] ==========================================');
-        debugPrint('[home] Tunnel URL available for sharing: $_tunnelUrl');
-        debugPrint('[home] HOST will use: http://localhost:3001');
-        debugPrint('[home] ==========================================');
-        // HOST always uses localhost, tunnel is only for viewers
-        setState(() {
-          _serverController.text = 'http://localhost:3001';
-          _serverReady = true;
-        });
-        return;
-      }
-
       // Try each port for a live server
       for (final port in ports) {
         try {
-          final response = await http.get(
-            Uri.parse('http://localhost:$port/api/tunnel'),
-          ).timeout(const Duration(seconds: 3));
+          final response = await http
+              .get(Uri.parse('http://localhost:$port/api/tunnel'))
+              .timeout(const Duration(seconds: 3));
           if (response.statusCode == 200) {
             final data = jsonDecode(response.body);
             // Store tunnel for sharing but use localhost for host connection
             _tunnelUrl = data['tunnel'] as String?;
             if (_tunnelUrl != null && _tunnelUrl!.isNotEmpty) {
-              debugPrint('[home] Tunnel URL available for sharing: $_tunnelUrl');
+              debugPrint(
+                '[home] Tunnel URL available for sharing: $_tunnelUrl',
+              );
             }
             // HOST always uses localhost
             _serverController.text = 'http://localhost:$port';
@@ -107,7 +93,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         }
       }
 
-      debugPrint('[home] No server found on ports $ports — showing button anyway');
+      debugPrint(
+        '[home] No server found on ports $ports — showing button anyway',
+      );
       _serverReady = true; // Let user try anyway
     } catch (e) {
       debugPrint('[home] Server detection failed: $e');
@@ -116,6 +104,48 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       if (mounted) {
         setState(() => _isDetecting = false);
       }
+    }
+  }
+
+  Future<void> _prewarmHostingServices() async {
+    if (_prewarmStarted) return;
+    _prewarmStarted = true;
+
+    final hasInviteArgs =
+        widget.arguments != null && widget.arguments!.isNotEmpty;
+    if (hasInviteArgs) {
+      debugPrint('[home] Prewarm skipped: opened via invite/deep-link');
+      return;
+    }
+
+    final currentServer = _serverController.text.trim().toLowerCase();
+    final isLocalDefault =
+        currentServer.isEmpty ||
+        currentServer.contains('localhost') ||
+        currentServer.contains('127.0.0.1');
+    if (!isLocalDefault) {
+      debugPrint(
+        '[home] Prewarm skipped: server URL is not local ($currentServer)',
+      );
+      return;
+    }
+
+    debugPrint('[home] Prewarming local signal+tunnel startup...');
+    try {
+      final torrent = TorrentService();
+      await torrent.checkAndStartSignalServer();
+
+      final tunnel = TorrentService.tunnelUrl;
+      if (mounted && tunnel != null && tunnel.isNotEmpty) {
+        setState(() {
+          _tunnelUrl = tunnel;
+        });
+        debugPrint(
+          '[home] Prewarm complete: tunnel ready for sharing: $tunnel',
+        );
+      }
+    } catch (e) {
+      debugPrint('[home] Prewarm failed (non-fatal): $e');
     }
   }
 
@@ -136,12 +166,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     if (lower.contains('/join/')) {
       final parts = lower.split('/join/');
       if (parts.length > 1) {
-        final code = parts[1].replaceAll(RegExp(r'[^a-z0-9]'), '').toUpperCase();
-        return code.isNotEmpty && code.length <= 6 ? code : null;
+        final code = parts[1]
+            .replaceAll(RegExp(r'[^a-z0-9]'), '')
+            .toUpperCase();
+        return code.length == 6 ? code : null;
       }
     }
     final codeOnly = input.replaceAll(RegExp(r'[^a-z0-9]'), '').toUpperCase();
-    return codeOnly.isNotEmpty && codeOnly.length <= 6 ? codeOnly : null;
+    return codeOnly.length == 6 ? codeOnly : null;
   }
 
   @override
@@ -156,15 +188,26 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     if (_isCreating) return;
     setState(() => _isCreating = true);
 
+    // Host flow: ensure local signal server + tunnel are running.
+    final torrent = TorrentService();
+    await torrent.checkAndStartSignalServer();
+    _tunnelUrl = TorrentService.tunnelUrl;
+    if (_tunnelUrl != null && _tunnelUrl!.isNotEmpty) {
+      debugPrint('[home] ==========================================');
+      debugPrint('[home] Tunnel URL available for sharing: $_tunnelUrl');
+      debugPrint('[home] HOST will use: http://localhost:3001');
+      debugPrint('[home] ==========================================');
+    }
+
     final provider = context.read<RoomProvider>();
     final serverUrl = _serverController.text.trim();
-    
+
     debugPrint('[home] ==========================================');
     debugPrint('[home] Creating room with:');
     debugPrint('[home]   Server URL (for host): $serverUrl');
     debugPrint('[home]   Tunnel URL (for sharing): $_tunnelUrl');
     debugPrint('[home] ==========================================');
-    
+
     // Pass tunnel URL for sharing (host uses localhost, viewers use tunnel)
     provider.setServerUrl(serverUrl, tunnelUrl: _tunnelUrl);
     provider.setUserName(_nameController.text.trim());
@@ -175,10 +218,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     setState(() => _isCreating = false);
 
     if (code.isNotEmpty) {
-      Navigator.push(
-        context,
-        _createRoute(const RoomScreen()),
-      );
+      Navigator.push(context, _createRoute(const RoomScreen()));
     } else {
       _showError(provider.error ?? 'Failed to create room');
     }
@@ -190,28 +230,45 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       _showError('Enter a room code or link');
       return;
     }
-    
+
     if (_isJoining) return;
     setState(() => _isJoining = true);
 
     String codeToUse = rawInput;
     String? explicitServerUrl;
-    
+    String? inviteToken;
+
     // Check if input contains '#' separator for ServerURL#RoomCode format
     if (rawInput.contains('#')) {
       final parts = rawInput.split('#');
       if (parts.length >= 2) {
         explicitServerUrl = parts[0].trim();
-        // Extract only the room code (first 6 alphanumeric chars)
-        final extractedCode = parts[1].trim().toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
-        codeToUse = extractedCode.length >= 6 ? extractedCode.substring(0, 6) : extractedCode;
+        final codeAndToken = parts[1].trim();
+        final firstColon = codeAndToken.indexOf(':');
+        if (firstColon > 0) {
+          codeToUse = codeAndToken.substring(0, firstColon).trim();
+          inviteToken = codeAndToken.substring(firstColon + 1).trim();
+        } else {
+          codeToUse = codeAndToken;
+        }
+
+        final extractedCode = codeToUse.toUpperCase().replaceAll(
+          RegExp(r'[^A-Z0-9]'),
+          '',
+        );
+        codeToUse = extractedCode.length >= 6
+            ? extractedCode.substring(0, 6)
+            : extractedCode;
         _hasExplicitServerUrl = true;
+
         // Update UI to reflect the parsed values
         setState(() {
           _serverController.text = explicitServerUrl!;
           _roomCodeController.text = codeToUse;
         });
-        debugPrint('[home] Parsed from link - server: $explicitServerUrl, room: $codeToUse');
+        debugPrint(
+          '[home] Parsed from link - server: $explicitServerUrl, room: $codeToUse, tokenPresent=${inviteToken != null && inviteToken.isNotEmpty}',
+        );
       }
     } else if (rawInput.toLowerCase().startsWith('http')) {
       // Handle URL without # - try to extract room code from query params or path
@@ -220,26 +277,36 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         // Check for room param in query
         final roomParam = uri.queryParameters['room'];
         if (roomParam != null && roomParam.isNotEmpty) {
-          explicitServerUrl = '${uri.scheme}://${uri.host}${uri.port != 0 ? ':${uri.port}' : ''}';
+          explicitServerUrl = uri.origin;
           codeToUse = roomParam.toUpperCase();
           _hasExplicitServerUrl = true;
           setState(() {
             _serverController.text = explicitServerUrl!;
             _roomCodeController.text = codeToUse;
           });
-          debugPrint('[home] Parsed server URL from query param: $explicitServerUrl');
+          debugPrint(
+            '[home] Parsed server URL from query param: $explicitServerUrl',
+          );
         } else {
           // Extract code from /join/CODE path
           final extracted = _extractRoomCode(rawInput);
           if (extracted != null) {
-            explicitServerUrl = '${uri.scheme}://${uri.host}${uri.port != 0 ? ':${uri.port}' : ''}';
+            explicitServerUrl = uri.origin;
             codeToUse = extracted;
             _hasExplicitServerUrl = true;
             setState(() {
               _serverController.text = explicitServerUrl!;
               _roomCodeController.text = codeToUse;
             });
-            debugPrint('[home] Parsed server URL from path: $explicitServerUrl');
+            debugPrint(
+              '[home] Parsed server URL from path: $explicitServerUrl',
+            );
+          } else {
+            // It's a valid URL but has no room code format inside it.
+            explicitServerUrl = uri.origin;
+            codeToUse = '';
+            _hasExplicitServerUrl = true;
+            setState(() => _serverController.text = explicitServerUrl!);
           }
         }
       } catch (_) {
@@ -254,11 +321,23 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       }
     }
 
+    if (codeToUse.length != 6) {
+      setState(() => _isJoining = false);
+      _showError('Invalid room code. It must be exactly 6 characters.');
+      return;
+    }
+
     final provider = context.read<RoomProvider>();
     final serverUrlToUse = explicitServerUrl ?? _serverController.text.trim();
-    debugPrint('[home] Joining with server URL: $serverUrlToUse, room: $codeToUse');
+    debugPrint(
+      '[home] Joining with server URL: $serverUrlToUse, room: $codeToUse',
+    );
     provider.setServerUrl(serverUrlToUse);
     provider.setUserName(_nameController.text.trim());
+    provider.setInviteToken(inviteToken);
+    debugPrint(
+      '[home] Invite token provided: ${inviteToken != null && inviteToken.isNotEmpty}',
+    );
 
     final success = await provider.requestJoin(codeToUse);
 
@@ -266,10 +345,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     setState(() => _isJoining = false);
 
     if (success) {
-      Navigator.push(
-        context,
-        _createRoute(const RoomScreen()),
-      );
+      Navigator.push(context, _createRoute(const RoomScreen()));
     } else {
       _showError(provider.error ?? 'Failed to join room');
     }
@@ -280,7 +356,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       SnackBar(
         content: Row(
           children: [
-            const Icon(Icons.error_outline_rounded, color: AppTheme.error, size: 20),
+            const Icon(
+              Icons.error_outline_rounded,
+              color: AppTheme.error,
+              size: 20,
+            ),
             const SizedBox(width: 12),
             Expanded(child: Text(msg)),
           ],
@@ -293,8 +373,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     return PageRouteBuilder(
       pageBuilder: (context, animation, secondaryAnimation) => page,
       transitionsBuilder: (context, animation, secondaryAnimation, child) {
-        final tween = Tween(begin: const Offset(1.0, 0.0), end: Offset.zero)
-            .chain(CurveTween(curve: Curves.easeOutCubic));
+        final tween = Tween(
+          begin: const Offset(1.0, 0.0),
+          end: Offset.zero,
+        ).chain(CurveTween(curve: Curves.easeOutCubic));
         return SlideTransition(position: animation.drive(tween), child: child);
       },
       transitionDuration: const Duration(milliseconds: 400),
@@ -312,7 +394,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           Container(
             decoration: const BoxDecoration(
               gradient: LinearGradient(
-                colors: [AppTheme.bgDeep, AppTheme.bgPrimary, Color(0xFF0D0D1E)],
+                colors: [
+                  AppTheme.bgDeep,
+                  AppTheme.bgPrimary,
+                  Color(0xFF0D0D1E),
+                ],
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
               ),
@@ -322,7 +408,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                 child: SingleChildScrollView(
                   padding: EdgeInsets.symmetric(
                     horizontal: AppTheme.spacingLG,
-                    vertical: isCompact ? AppTheme.spacingMD : AppTheme.spacingXL,
+                    vertical: isCompact
+                        ? AppTheme.spacingMD
+                        : AppTheme.spacingXL,
                   ),
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 440),
@@ -350,8 +438,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                         SizedBox(
                           width: double.infinity,
                           child: GradientButton(
-                            label: _serverReady ? 'Host Room' : 'Starting server...',
-                            icon: _serverReady ? Icons.add_circle_outline_rounded : Icons.hourglass_empty,
+                            label: _serverReady
+                                ? 'Host Room'
+                                : 'Starting server...',
+                            icon: _serverReady
+                                ? Icons.add_circle_outline_rounded
+                                : Icons.hourglass_empty,
                             isLoading: _isCreating || !_serverReady,
                             onPressed: _serverReady ? _createRoom : null,
                           ),
@@ -375,8 +467,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                         SizedBox(
                           width: double.infinity,
                           child: _buildOutlinedButton(
-                            label: _serverReady ? 'Join Room' : 'Starting server...',
-                            icon: _serverReady ? Icons.login_rounded : Icons.hourglass_empty,
+                            label: _serverReady
+                                ? 'Join Room'
+                                : 'Starting server...',
+                            icon: _serverReady
+                                ? Icons.login_rounded
+                                : Icons.hourglass_empty,
                             isLoading: _isJoining || !_serverReady,
                             onPressed: _serverReady ? () => _joinRoom() : () {},
                           ),
@@ -451,10 +547,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       child: Text(
         'ShareStream',
         style: Theme.of(context).textTheme.displayMedium?.copyWith(
-              color: Colors.white,
-              fontWeight: FontWeight.w800,
-              letterSpacing: -1,
-            ),
+          color: Colors.white,
+          fontWeight: FontWeight.w800,
+          letterSpacing: -1,
+        ),
       ),
     ).animate().fadeIn(delay: 100.ms);
   }
@@ -462,9 +558,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   Widget _buildSubtitle() {
     return Text(
       'Watch together, instantly.',
-      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-            color: AppTheme.textSecondary,
-          ),
+      style: Theme.of(
+        context,
+      ).textTheme.bodyLarge?.copyWith(color: AppTheme.textSecondary),
     ).animate().fadeIn(delay: 150.ms);
   }
 
@@ -476,9 +572,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Text(
             'or',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppTheme.textMuted,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: AppTheme.textMuted),
           ),
         ),
         Expanded(child: Divider(color: AppTheme.border.withValues(alpha: 0.5))),
@@ -495,7 +591,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     return OutlinedButton(
       onPressed: isLoading ? null : onPressed,
       style: OutlinedButton.styleFrom(
-        side: BorderSide(color: AppTheme.primary.withValues(alpha: 0.5), width: 1.5),
+        side: BorderSide(
+          color: AppTheme.primary.withValues(alpha: 0.5),
+          width: 1.5,
+        ),
         padding: const EdgeInsets.symmetric(vertical: 16),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
@@ -505,7 +604,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           ? const SizedBox(
               height: 22,
               width: 22,
-              child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.primary),
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: AppTheme.primary,
+              ),
             )
           : Row(
               mainAxisAlignment: MainAxisAlignment.center,
@@ -531,17 +633,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(
-            Icons.settings_outlined,
-            size: 16,
-            color: AppTheme.textMuted,
-          ),
+          Icon(Icons.settings_outlined, size: 16, color: AppTheme.textMuted),
           const SizedBox(width: 6),
           Text(
             _showSettings ? 'Hide Settings' : 'Server Settings',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppTheme.textMuted,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: AppTheme.textMuted),
           ),
           const SizedBox(width: 4),
           Icon(
@@ -557,7 +655,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   Widget _buildSettingsPanel() {
     // Display tunnel URL if available (for sharing with viewers)
     final displayUrl = _tunnelUrl ?? _serverController.text;
-    
+
     return GlassCard(
       padding: const EdgeInsets.all(AppTheme.spacingMD),
       child: Column(
@@ -568,9 +666,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               Text(
                 _tunnelUrl != null ? 'Share URL (for viewers)' : 'Server URL',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: AppTheme.textSecondary,
-                      fontWeight: FontWeight.w600,
-                    ),
+                  color: AppTheme.textSecondary,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
               const Spacer(),
               if (_isDetecting)
@@ -596,9 +694,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             Text(
               'Host connects via: localhost:3001',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: AppTheme.textMuted,
-                    fontSize: 11,
-                  ),
+                color: AppTheme.textMuted,
+                fontSize: 11,
+              ),
             ),
           ],
         ],

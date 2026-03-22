@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,42 +19,66 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
+	pionLogging "github.com/pion/logging"
+	"github.com/pion/turn/v4"
 	"github.com/zishang520/engine.io/v2/types"
 	"github.com/zishang520/socket.io/v2/socket"
 )
 
+const inviteTokenTTL = 24 * time.Hour
+
 var (
 	port     = flag.Int("port", 3001, "Server port")
+	turnPort = flag.Int("turn-port", 3478, "Embedded TURN server port")
 	noTunnel = flag.Bool("no-tunnel", false, "Disable automatic tunnel creation")
+	noTurn   = flag.Bool("no-turn", false, "Disable embedded TURN server")
 
 	io_       *socket.Server
 	tunnelURL string
 	tunnelMu  sync.RWMutex
 
+	// Embedded TURN server state
+	turnTunnelURL string
+	turnTunnelMu  sync.RWMutex
+	turnUsername  string
+	turnPassword  string
+	turnServer    *turn.Server
+
 	// Socket to participant ID mapping for WebRTC signaling
 	socketToParticipant = make(map[string]string)
 	participantToSocket = make(map[string]string)
 	participantMu       sync.RWMutex
+
+	cloudflaredCmd   *exec.Cmd
+	cloudflaredCmdMu sync.Mutex
+	shuttingDown     bool
 )
 
 // ── Room Management ──────────────────────────────────────────────────────────
 
 type Room struct {
-	Code          string
-	Host          string
-	Approved      map[string]bool
-	Pending       map[string]string
-	ApprovedNames map[string]string
-	ReadyViewers  map[string]bool
-	HostTimestamp time.Time
-	HostState     string
-	mu            sync.RWMutex
+	Code            string
+	Host            string
+	Approved        map[string]bool
+	Pending         map[string]string
+	ApprovedNames   map[string]string
+	ReadyViewers    map[string]bool
+	LastControlSeq  int64
+	LastActionIDs   map[string]int64
+	LastControlAt   map[string]int64
+	LastSeekAt      map[string]int64
+	PlaybackTime    float64
+	PlaybackPlaying bool
+	HostTimestamp   time.Time
+	HostState       string
+	mu              sync.RWMutex
 }
 
 type RoomManager struct {
@@ -72,6 +100,9 @@ func (rm *RoomManager) CreateRoom(code, hostID string) *Room {
 		Pending:       make(map[string]string),
 		ApprovedNames: make(map[string]string),
 		ReadyViewers:  make(map[string]bool),
+		LastActionIDs: make(map[string]int64),
+		LastControlAt: make(map[string]int64),
+		LastSeekAt:    make(map[string]int64),
 	}
 	rm.rooms[code] = room
 	return room
@@ -95,6 +126,22 @@ var roomManager = NewRoomManager()
 
 func main() {
 	flag.Parse()
+
+	// Generate random TURN credentials
+	turnUsername = fmt.Sprintf("sharestream_%d", rand.Intn(999999))
+	turnPassword = generateRandomString(24)
+	log.Printf("[turn] Generated TURN credentials: user=%s", turnUsername)
+
+	// Start embedded TURN server (if not disabled)
+	if !*noTurn {
+		go func() {
+			if err := startEmbeddedTURN(*turnPort); err != nil {
+				log.Printf("[turn] Failed to start embedded TURN: %v", err)
+			} else {
+				log.Printf("[turn] Embedded TURN server running on port %d", *turnPort)
+			}
+		}()
+	}
 
 	// Start cloudflared tunnel in background (if not disabled)
 	if !*noTunnel {
@@ -131,6 +178,10 @@ func main() {
 			delete(socketToParticipant, string(client.Id()))
 			delete(participantToSocket, participantID)
 			participantMu.Unlock()
+
+			if participantID != "" {
+				cleanupParticipantFromRooms(participantID)
+			}
 
 			if participantID != "" {
 				log.Printf("[JOIN] Cleaned up mapping for participant %s", participantID)
@@ -179,6 +230,10 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down...")
+	if turnServer != nil {
+		turnServer.Close()
+	}
+	stopCloudflaredTunnel()
 	io_.Close(nil)
 	srv.Close()
 }
@@ -237,17 +292,13 @@ func registerEventHandlers(client *socket.Socket) {
 		data := parseData(args)
 		handleBroadcastToRooms(client, "movie-loaded", data)
 	})
-	client.On("sync-play", func(args ...any) {
+	client.On("control-request", func(args ...any) {
 		data := parseData(args)
-		handleBroadcastToRooms(client, "sync-play", data)
+		handleControlRequest(client, data)
 	})
-	client.On("sync-pause", func(args ...any) {
+	client.On("control-ack", func(args ...any) {
 		data := parseData(args)
-		handleBroadcastToRooms(client, "sync-pause", data)
-	})
-	client.On("sync-seek", func(args ...any) {
-		data := parseData(args)
-		handleBroadcastToRooms(client, "sync-seek", data)
+		handleControlAck(client, data)
 	})
 	client.On("start-webrtc", func(args ...any) {
 		data := parseData(args)
@@ -338,6 +389,12 @@ func registerEventHandlers(client *socket.Socket) {
 		data := parseData(args)
 		handleSyncUpdate(client, data)
 	})
+
+	// Torrent peer exchange
+	client.On("torrent-peer-info", func(args ...any) {
+		data := parseData(args)
+		handleTorrentPeerExchange(client, data)
+	})
 }
 
 // parseData extracts the first argument as a map[string]interface{}.
@@ -376,9 +433,29 @@ func parseData(args []any) map[string]interface{} {
 
 func handleCreateRoom(s *socket.Socket, data map[string]interface{}) {
 	log.Printf("Create room: %+v", data)
+	participantID, _ := data["participantId"].(string)
+	name, _ := data["name"].(string)
+	if participantID == "" {
+		participantID = string(s.Id())
+	}
+	if name == "" {
+		name = "Host"
+	}
+
+	participantMu.Lock()
+	socketToParticipant[string(s.Id())] = participantID
+	participantToSocket[participantID] = string(s.Id())
+	participantMu.Unlock()
+
 	code := generateRoomCode()
-	roomManager.CreateRoom(code, string(s.Id()))
+	room := roomManager.CreateRoom(code, participantID)
+	room.mu.Lock()
+	room.Approved[participantID] = true
+	room.ApprovedNames[participantID] = name
+	room.mu.Unlock()
+
 	s.Join(socket.Room(code))
+	s.Join(socket.Room(participantID))
 
 	tunnelMu.RLock()
 	tURL := tunnelURL
@@ -387,9 +464,10 @@ func handleCreateRoom(s *socket.Socket, data map[string]interface{}) {
 	s.Emit("room-created", map[string]interface{}{
 		"success": true,
 		"room": map[string]interface{}{
-			"code":   code,
-			"role":   "host",
-			"tunnel": tURL,
+			"code":        code,
+			"role":        "host",
+			"tunnel":      tURL,
+			"inviteToken": makeInviteToken(code),
 		},
 	})
 }
@@ -441,6 +519,27 @@ func handleJoinRoom(s *socket.Socket, data map[string]interface{}) {
 			"role": "viewer",
 		},
 	})
+
+	room.mu.RLock()
+	lastSeq := room.LastControlSeq
+	lastTime := room.PlaybackTime
+	playing := room.PlaybackPlaying
+	room.mu.RUnlock()
+	if lastSeq > 0 {
+		actionType := "pause"
+		if playing {
+			actionType = "play"
+		}
+		s.Emit("playback-snapshot", map[string]interface{}{
+			"serverSeq": lastSeq,
+			"playback": map[string]interface{}{
+				"serverSeq": lastSeq,
+				"time":      lastTime,
+				"type":      actionType,
+			},
+		})
+	}
+
 	io_.To(socket.Room(code)).Emit("participant-joined", map[string]interface{}{
 		"id":   participantID,
 		"name": name,
@@ -451,12 +550,70 @@ func handleLeaveRoom(s *socket.Socket, data map[string]interface{}) {
 	log.Printf("Leave room: %+v", data)
 	code, ok := data["code"].(string)
 	if !ok {
+		// If no code provided, try to leave all rooms
+		rooms := s.Rooms().Keys()
+		for _, room := range rooms {
+			if room != socket.Room(s.Id()) {
+				s.Leave(room)
+			}
+		}
 		return
 	}
+
+	// Get participant ID for the leaving socket
+	participantMu.RLock()
+	participantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+
 	s.Leave(socket.Room(code))
+
+	// Clean up room state
+	room := roomManager.GetRoom(code)
+	if room != nil {
+		room.mu.Lock()
+		delete(room.Approved, participantID)
+		delete(room.ApprovedNames, participantID)
+		delete(room.Pending, participantID)
+		delete(room.ReadyViewers, string(s.Id()))
+		room.mu.Unlock()
+	}
+
+	emitID := participantID
+	if emitID == "" {
+		emitID = string(s.Id())
+	}
 	io_.To(socket.Room(code)).Emit("participant-left", map[string]interface{}{
-		"id": string(s.Id()),
+		"id": emitID,
 	})
+}
+
+func cleanupParticipantFromRooms(participantID string) {
+	roomManager.mu.RLock()
+	rooms := make([]*Room, 0, len(roomManager.rooms))
+	for _, room := range roomManager.rooms {
+		rooms = append(rooms, room)
+	}
+	roomManager.mu.RUnlock()
+
+	for _, room := range rooms {
+		room.mu.Lock()
+		_, wasApproved := room.Approved[participantID]
+		delete(room.Approved, participantID)
+		delete(room.ApprovedNames, participantID)
+		delete(room.Pending, participantID)
+		for sid := range room.ReadyViewers {
+			if sid == participantID {
+				delete(room.ReadyViewers, sid)
+			}
+		}
+		room.mu.Unlock()
+
+		if wasApproved {
+			io_.To(socket.Room(room.Code)).Emit("participant-left", map[string]interface{}{
+				"id": participantID,
+			})
+		}
+	}
 }
 
 func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
@@ -464,6 +621,7 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 	code, ok := data["code"].(string)
 	name, nameOk := data["name"].(string)
 	participantID, pOk := data["participantId"].(string)
+	inviteToken, _ := data["inviteToken"].(string)
 	if !ok || !nameOk || !pOk {
 		s.Emit("join-request-result", map[string]interface{}{
 			"success": false,
@@ -477,6 +635,24 @@ func handleJoinRequest(s *socket.Socket, data map[string]interface{}) {
 		s.Emit("join-request-result", map[string]interface{}{
 			"success": false,
 			"error":   "room not found",
+		})
+		return
+	}
+
+	if inviteToken == "" {
+		log.Printf("[JOIN] Missing invite token for room %s participant %s", code, participantID)
+		s.Emit("join-request-result", map[string]interface{}{
+			"success": false,
+			"error":   "invite token required",
+		})
+		return
+	}
+
+	if !validateInviteToken(code, inviteToken) {
+		log.Printf("[JOIN] Invalid invite token for room %s participant %s", code, participantID)
+		s.Emit("join-request-result", map[string]interface{}{
+			"success": false,
+			"error":   "invalid or expired invite token",
 		})
 		return
 	}
@@ -547,11 +723,7 @@ func handleJoinApprove(s *socket.Socket, data map[string]interface{}) {
 	room.mu.RLock()
 	name := room.ApprovedNames[participantID]
 	room.mu.RUnlock()
-
-	io_.To(socket.Room(code)).Emit("participant-joined", map[string]interface{}{
-		"id":   participantID,
-		"name": name,
-	})
+	_ = name
 }
 
 func handleJoinReject(s *socket.Socket, data map[string]interface{}) {
@@ -609,9 +781,14 @@ func handleRequestJoinApproval(s *socket.Socket, data map[string]interface{}) {
 		return
 	}
 
+	// Look up participant ID from socket ID
+	participantMu.RLock()
+	participantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+
 	room.mu.RLock()
-	_, isApproved := room.Approved[string(s.Id())]
-	_, isPending := room.Pending[string(s.Id())]
+	_, isApproved := room.Approved[participantID]
+	_, isPending := room.Pending[participantID]
 	room.mu.RUnlock()
 
 	if isApproved {
@@ -643,9 +820,19 @@ func handleBroadcastToRooms(s *socket.Socket, event string, data map[string]inte
 		log.Printf("[broadcast] Warning: socket %s is not in any rooms", s.Id())
 		return
 	}
+
+	// Get participant ID to skip participant-specific rooms
+	participantMu.RLock()
+	myParticipantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+
 	for _, room := range rooms {
-		// Skip the socket's personal ID room (if it exists)
+		// Skip the socket's personal ID room
 		if room == socket.Room(s.Id()) {
+			continue
+		}
+		// Skip participant ID rooms (only broadcast to actual room-code rooms)
+		if myParticipantID != "" && room == socket.Room(myParticipantID) {
 			continue
 		}
 		log.Printf("[broadcast] Emitting %s to room %s", event, room)
@@ -755,7 +942,12 @@ func handleSyncReport(s *socket.Socket, data map[string]interface{}) {
 		return
 	}
 
-	participantID, _ := data["participantId"].(string)
+	participantMu.RLock()
+	participantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+	if participantID == "" {
+		participantID = string(s.Id())
+	}
 	timeVal, _ := data["time"].(float64)
 	playing, _ := data["playing"].(bool)
 	buffered, _ := data["buffered"].(float64)
@@ -782,8 +974,25 @@ func handleSyncCorrect(s *socket.Socket, data map[string]interface{}) {
 
 	timeVal, tOk := data["time"].(float64)
 	playing, playOk := data["playing"].(bool)
+	code, _ := data["code"].(string)
 	if !tOk || !playOk {
 		return
+	}
+
+	if code != "" {
+		room := roomManager.GetRoom(code)
+		if room == nil {
+			return
+		}
+		participantMu.RLock()
+		senderParticipantID := socketToParticipant[string(s.Id())]
+		participantMu.RUnlock()
+		room.mu.RLock()
+		senderIsHost := senderParticipantID != "" && senderParticipantID == room.Host
+		room.mu.RUnlock()
+		if !senderIsHost {
+			return
+		}
 	}
 
 	io_.To(socket.Room(participantID)).Emit("sync-correct", map[string]interface{}{
@@ -826,6 +1035,139 @@ func handleSyncUpdate(s *socket.Socket, data map[string]interface{}) {
 	})
 }
 
+func handleControlRequest(s *socket.Socket, data map[string]interface{}) {
+	code, ok := data["code"].(string)
+	if !ok || code == "" {
+		return
+	}
+
+	room := roomManager.GetRoom(code)
+	if room == nil {
+		return
+	}
+
+	participantMu.RLock()
+	senderParticipantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+	if senderParticipantID == "" {
+		senderParticipantID = string(s.Id())
+	}
+
+	actionID, _ := data["actionId"].(string)
+	actionType, _ := data["actionType"].(string)
+	targetTimeSec, _ := data["targetTimeSec"].(float64)
+	playWhenReady, _ := data["playWhenReady"].(bool)
+	if actionType == "" {
+		return
+	}
+
+	nowMs := time.Now().UnixMilli()
+
+	room.mu.Lock()
+	if _, joined := room.Approved[senderParticipantID]; !joined {
+		room.mu.Unlock()
+		return
+	}
+
+	const controlRateWindowMs int64 = 1000
+	const controlRateLimitPerSec int64 = 6
+	const seekCooldownMs int64 = 300
+
+	lastControlAt := room.LastControlAt[senderParticipantID]
+	if lastControlAt > 0 && (nowMs-lastControlAt) < (controlRateWindowMs/controlRateLimitPerSec) {
+		room.mu.Unlock()
+		return
+	}
+	room.LastControlAt[senderParticipantID] = nowMs
+
+	if actionType == "seek" {
+		lastSeekAt := room.LastSeekAt[senderParticipantID]
+		if lastSeekAt > 0 && (nowMs-lastSeekAt) < seekCooldownMs {
+			room.mu.Unlock()
+			return
+		}
+		room.LastSeekAt[senderParticipantID] = nowMs
+	}
+
+	if actionID != "" {
+		if seenAt, exists := room.LastActionIDs[actionID]; exists && (nowMs-seenAt) < 120000 {
+			room.mu.Unlock()
+			return
+		}
+		room.LastActionIDs[actionID] = nowMs
+	}
+
+	for id, seenAt := range room.LastActionIDs {
+		if (nowMs - seenAt) > 120000 {
+			delete(room.LastActionIDs, id)
+		}
+	}
+
+	room.LastControlSeq++
+	serverSeq := room.LastControlSeq
+	room.PlaybackTime = targetTimeSec
+	if actionType == "play" {
+		room.PlaybackPlaying = true
+	} else if actionType == "pause" {
+		room.PlaybackPlaying = false
+	} else {
+		room.PlaybackPlaying = playWhenReady
+	}
+	playing := room.PlaybackPlaying
+	room.mu.Unlock()
+
+	io_.To(socket.Room(code)).Emit("control-committed", map[string]interface{}{
+		"serverSeq":              serverSeq,
+		"actionId":               actionID,
+		"actionType":             actionType,
+		"targetTimeSec":          targetTimeSec,
+		"playWhenReady":          playing,
+		"initiatorParticipantId": senderParticipantID,
+		"serverCommitMs":         nowMs,
+	})
+}
+
+func handleControlAck(s *socket.Socket, data map[string]interface{}) {
+	code, ok := data["code"].(string)
+	if !ok || code == "" {
+		return
+	}
+
+	room := roomManager.GetRoom(code)
+	if room == nil {
+		return
+	}
+
+	participantMu.RLock()
+	senderParticipantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+	if senderParticipantID == "" {
+		senderParticipantID = string(s.Id())
+	}
+
+	room.mu.RLock()
+	_, joined := room.Approved[senderParticipantID]
+	hostID := room.Host
+	room.mu.RUnlock()
+	if !joined {
+		return
+	}
+
+	serverSeq, _ := data["serverSeq"].(float64)
+	currentTimeSec, _ := data["currentTimeSec"].(float64)
+	playing, _ := data["playing"].(bool)
+	bufferedSec, _ := data["bufferedSec"].(float64)
+
+	io_.To(socket.Room(hostID)).Emit("control-ack", map[string]interface{}{
+		"participantId":  senderParticipantID,
+		"serverSeq":      int64(serverSeq),
+		"currentTimeSec": currentTimeSec,
+		"playing":        playing,
+		"bufferedSec":    bufferedSec,
+		"timestamp":      time.Now().UnixMilli(),
+	})
+}
+
 // ── HTTP Handlers ────────────────────────────────────────────────────────────
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -848,7 +1190,68 @@ func handleTunnelURL(w http.ResponseWriter, r *http.Request) {
 
 func handleTurnServers(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"iceServers":[{"urls":"stun:stun.l.google.com:19302"},{"urls":"stun:stun1.l.google.com:19302"}]}`)
+
+	iceServers := []map[string]interface{}{
+		{"urls": "stun:stun.l.google.com:19302"},
+		{"urls": "stun:stun1.l.google.com:19302"},
+	}
+
+	// Add embedded TURN server if running
+	if !*noTurn && turnUsername != "" && turnPassword != "" {
+		// For local clients, use localhost TURN
+		iceServers = append(iceServers, map[string]interface{}{
+			"urls":       fmt.Sprintf("turn:127.0.0.1:%d?transport=tcp", *turnPort),
+			"username":   turnUsername,
+			"credential": turnPassword,
+		})
+		iceServers = append(iceServers, map[string]interface{}{
+			"urls":       fmt.Sprintf("turn:127.0.0.1:%d", *turnPort),
+			"username":   turnUsername,
+			"credential": turnPassword,
+		})
+
+		// For remote clients, detect their IP and serve appropriate TURN URL
+		remoteIP := r.Header.Get("X-Forwarded-For")
+		if remoteIP == "" {
+			remoteIP = r.RemoteAddr
+		}
+		isLocal := strings.HasPrefix(remoteIP, "127.") ||
+			strings.HasPrefix(remoteIP, "localhost") ||
+			strings.HasPrefix(remoteIP, "::1") ||
+			strings.HasPrefix(remoteIP, "[::1]")
+
+		if !isLocal {
+			// Remote client — give them the public IP or tunnel URL
+			turnTunnelMu.RLock()
+			tURL := turnTunnelURL
+			turnTunnelMu.RUnlock()
+
+			if tURL != "" {
+				iceServers = append(iceServers, map[string]interface{}{
+					"urls":       tURL,
+					"username":   turnUsername,
+					"credential": turnPassword,
+				})
+			}
+		}
+		log.Printf("[turn] Serving embedded TURN to %s (local=%v)", remoteIP, isLocal)
+	}
+
+	// Also add TURN servers from environment if configured (override)
+	envTurnURL := os.Getenv("TURN_URL")
+	envTurnUser := os.Getenv("TURN_USERNAME")
+	envTurnCred := os.Getenv("TURN_CREDENTIAL")
+	if envTurnURL != "" && envTurnUser != "" && envTurnCred != "" {
+		iceServers = append(iceServers, map[string]interface{}{
+			"urls":       envTurnURL,
+			"username":   envTurnUser,
+			"credential": envTurnCred,
+		})
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"iceServers": iceServers,
+	})
 }
 
 func handleGetRoom(w http.ResponseWriter, r *http.Request) {
@@ -856,9 +1259,9 @@ func handleGetRoom(w http.ResponseWriter, r *http.Request) {
 	room := roomManager.GetRoom(code)
 	w.Header().Set("Content-Type", "application/json")
 	if room == nil {
-		fmt.Fprintf(w, `{"error":"room not found"}`)
+		json.NewEncoder(w).Encode(map[string]interface{}{"error": "room not found"})
 	} else {
-		fmt.Fprintf(w, `{"code":"%s","host":"%s"}`, room.Code, room.Host)
+		json.NewEncoder(w).Encode(map[string]interface{}{"code": room.Code, "host": room.Host})
 	}
 }
 
@@ -872,9 +1275,9 @@ func handleJoinPage(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if room == nil {
-		fmt.Fprintf(w, `{"error":"room not found","code":"%s"}`, code)
+		json.NewEncoder(w).Encode(map[string]interface{}{"error": "room not found", "code": code})
 	} else {
-		fmt.Fprintf(w, `{"code":"%s","host":"%s","tunnel":"%s"}`, room.Code, room.Host, tURL)
+		json.NewEncoder(w).Encode(map[string]interface{}{"code": room.Code, "host": room.Host, "tunnel": tURL})
 	}
 }
 
@@ -897,13 +1300,20 @@ func handleGetReadyCount(w http.ResponseWriter, r *http.Request) {
 var tunnelReadyCh = make(chan struct{}, 1)
 
 func startCloudflaredTunnel(port int) {
+	cloudflaredCmdMu.Lock()
+	if shuttingDown {
+		cloudflaredCmdMu.Unlock()
+		return
+	}
+	cloudflaredCmdMu.Unlock()
+
 	cfPath, err := findOrDownloadCloudflared()
 	if err != nil {
 		log.Printf("cloudflared not available: %v", err)
 		return
 	}
 
-	cmd := exec.Command(cfPath, "tunnel", "--url", fmt.Sprintf("http://localhost:%d", port))
+	cmd := exec.Command(cfPath, "tunnel", "--url", fmt.Sprintf("http://127.0.0.1:%d", port))
 	cmd.Env = os.Environ()
 
 	stderr, err := cmd.StderrPipe()
@@ -916,6 +1326,10 @@ func startCloudflaredTunnel(port int) {
 		log.Printf("Failed to start cloudflared: %v", err)
 		return
 	}
+
+	cloudflaredCmdMu.Lock()
+	cloudflaredCmd = cmd
+	cloudflaredCmdMu.Unlock()
 
 	scanner := bufio.NewScanner(stderr)
 	var wg sync.WaitGroup
@@ -947,7 +1361,45 @@ func startCloudflaredTunnel(port int) {
 	}()
 
 	wg.Wait()
+	if err := cmd.Wait(); err != nil {
+		log.Printf("cloudflared exited: %v", err)
+	}
+
+	cloudflaredCmdMu.Lock()
+	if cloudflaredCmd == cmd {
+		cloudflaredCmd = nil
+	}
+	shouldRestart := !shuttingDown
+	cloudflaredCmdMu.Unlock()
+
+	if shouldRestart {
+		tunnelMu.Lock()
+		tunnelURL = ""
+		tunnelMu.Unlock()
+		log.Println("Cloudflare tunnel closed; restarting in 2s")
+		time.Sleep(2 * time.Second)
+		go startCloudflaredTunnel(port)
+		return
+	}
+
 	log.Println("Cloudflare tunnel closed")
+}
+
+func stopCloudflaredTunnel() {
+	cloudflaredCmdMu.Lock()
+	shuttingDown = true
+	cmd := cloudflaredCmd
+	cloudflaredCmdMu.Unlock()
+
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	if runtime.GOOS == "windows" {
+		_ = exec.Command("taskkill", "/PID", strconv.Itoa(cmd.Process.Pid), "/T", "/F").Run()
+	} else {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+	}
 }
 
 func findOrDownloadCloudflared() (string, error) {
@@ -1046,7 +1498,117 @@ func findOrDownloadCloudflared() (string, error) {
 	return localPath, nil
 }
 
+// ── Embedded TURN Server ─────────────────────────────────────────────────────
+
+func startEmbeddedTURN(port int) error {
+	// Listen on both UDP and TCP for maximum compatibility
+	udpAddr := fmt.Sprintf("0.0.0.0:%d", port)
+	tcpAddr := fmt.Sprintf("0.0.0.0:%d", port)
+
+	// UDP listener
+	udpListener, err := net.ListenPacket("udp4", udpAddr)
+	if err != nil {
+		log.Printf("[turn] UDP listen failed on %s: %v — trying TCP only", udpAddr, err)
+		udpListener = nil
+	}
+
+	// TCP listener
+	tcpListener, err := net.Listen("tcp4", tcpAddr)
+	if err != nil {
+		log.Printf("[turn] TCP listen failed on %s: %v", tcpAddr, err)
+		if udpListener == nil {
+			return fmt.Errorf("both UDP and TCP listen failed for TURN on port %d", port)
+		}
+	}
+
+	logFactory := pionLogging.NewDefaultLoggerFactory()
+	logFactory.DefaultLogLevel = pionLogging.LogLevelInfo
+
+	// Build the TURN server config
+	cfg := turn.ServerConfig{
+		Realm: "sharestream",
+		AuthHandler: func(username, realm string, srcAddr net.Addr) ([]byte, bool) {
+			if username == turnUsername {
+				return turn.GenerateAuthKey(turnUsername, "sharestream", turnPassword), true
+			}
+			return nil, false
+		},
+		LoggerFactory: logFactory,
+	}
+
+	if udpListener != nil {
+		cfg.PacketConnConfigs = []turn.PacketConnConfig{
+			{
+				PacketConn: udpListener,
+				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP("0.0.0.0"),
+					Address:      "0.0.0.0",
+				},
+			},
+		}
+		log.Printf("[turn] UDP listener on %s", udpAddr)
+	}
+
+	if tcpListener != nil {
+		cfg.ListenerConfigs = []turn.ListenerConfig{
+			{
+				Listener: tcpListener,
+				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP("0.0.0.0"),
+					Address:      "0.0.0.0",
+				},
+			},
+		}
+		log.Printf("[turn] TCP listener on %s", tcpAddr)
+	}
+
+	s, err := turn.NewServer(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create TURN server: %w", err)
+	}
+
+	turnServer = s
+	log.Printf("[turn] ✅ Embedded TURN server started on port %d (UDP+TCP)", port)
+	log.Printf("[turn]    Credentials: user=%s", turnUsername)
+	return nil
+}
+
+// ── Torrent Peer Exchange ────────────────────────────────────────────────────
+
+func handleTorrentPeerExchange(s *socket.Socket, data map[string]interface{}) {
+	log.Printf("[pex] Torrent peer info from %s: %+v", s.Id(), data)
+
+	// Get sender's participant ID
+	participantMu.RLock()
+	myParticipantID := socketToParticipant[string(s.Id())]
+	participantMu.RUnlock()
+	if myParticipantID == "" {
+		myParticipantID = string(s.Id())
+	}
+
+	// Add sender identity to the data
+	data["from"] = myParticipantID
+
+	// Broadcast to all rooms the client is in (excluding personal rooms)
+	for _, room := range s.Rooms().Keys() {
+		if room == socket.Room(s.Id()) || room == socket.Room(myParticipantID) {
+			continue
+		}
+		log.Printf("[pex] Broadcasting torrent peer info to room %s", room)
+		s.To(room).Emit("torrent-peer-info", data)
+	}
+}
+
 // ── Utilities ────────────────────────────────────────────────────────────────
+
+func generateRandomString(length int) string {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	result := make([]byte, length)
+	for i := range result {
+		result[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(result)
+}
 
 func generateRoomCode() string {
 	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -1055,4 +1617,56 @@ func generateRoomCode() string {
 		result[i] = chars[rand.Intn(len(chars))]
 	}
 	return string(result)
+}
+
+func inviteSecret() string {
+	secret := os.Getenv("INVITE_SECRET")
+	if secret != "" {
+		return secret
+	}
+	return "sharestream-default-dev-secret-change-me"
+}
+
+func makeInviteToken(roomCode string) string {
+	expiresAt := time.Now().Add(inviteTokenTTL).Unix()
+	payload := roomCode + ":" + strconv.FormatInt(expiresAt, 10)
+	h := hmac.New(sha256.New, []byte(inviteSecret()))
+	h.Write([]byte(payload))
+	sig := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+	encodedPayload := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	return encodedPayload + "." + sig
+}
+
+func validateInviteToken(roomCode, token string) bool {
+	if token == "" {
+		return false
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	payload := string(payloadBytes)
+	payloadParts := strings.Split(payload, ":")
+	if len(payloadParts) != 2 {
+		return false
+	}
+	payloadRoom := payloadParts[0]
+	expiresAt, err := strconv.ParseInt(payloadParts[1], 10, 64)
+	if err != nil {
+		return false
+	}
+	if payloadRoom != roomCode {
+		return false
+	}
+	if time.Now().Unix() > expiresAt {
+		return false
+	}
+	h := hmac.New(sha256.New, []byte(inviteSecret()))
+	h.Write([]byte(payload))
+	expectedSig := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+	return hmac.Equal([]byte(parts[1]), []byte(expectedSig))
 }
